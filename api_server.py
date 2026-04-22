@@ -172,11 +172,174 @@ def ai_chat(req: AIRequest):
 
 
 # ============================================================
-# Web 搜索接口 (新增,用于短新闻补充资料)
+# Web 搜索接口 (v16: 多源兜底, 国内可用)
 # ============================================================
+# v16-fix: 完整浏览器请求头(解决了国内搜索引擎 bot 检测返回 403 的问题)
+_BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/121.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
+
+
+def _bing_cn_search(query: str, max_results: int = 5):
+    """必应国内版(cn.bing.com, 国内可直连)."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        print("[Search] 缺少 beautifulsoup4, 请 pip install beautifulsoup4 lxml")
+        return []
+    try:
+        url = "https://cn.bing.com/search"
+        params = {"q": query, "mkt": "zh-CN", "ensearch": "0"}
+        r = requests.get(url, params=params, headers=_BROWSER_HEADERS, timeout=15)
+        if r.status_code != 200:
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        results = []
+        for li in soup.select("li.b_algo"):
+            h2 = li.find("h2")
+            if not h2:
+                continue
+            a = h2.find("a")
+            if not a:
+                continue
+            title = a.get_text(strip=True)
+            url_ = a.get("href", "")
+            if not title or not url_.startswith(("http://", "https://")):
+                continue
+            # snippet: b_caption 下的 p
+            snippet = ""
+            cap = li.select_one(".b_caption p, .b_caption")
+            if cap:
+                snippet = cap.get_text(" ", strip=True)[:300]
+            results.append({"title": title, "url": url_, "snippet": snippet})
+            if len(results) >= max_results:
+                break
+        return results
+    except Exception as e:
+        print(f"[Search] Bing CN 失败: {e}")
+        return []
+
+
+def _baidu_search(query: str, max_results: int = 5):
+    """百度搜索(国内直连)."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        print("[Search] 缺少 beautifulsoup4, 请 pip install beautifulsoup4 lxml")
+        return []
+    try:
+        url = "https://www.baidu.com/s"
+        params = {"wd": query, "rn": str(max_results * 2)}
+        r = requests.get(url, params=params, headers=_BROWSER_HEADERS, timeout=15)
+        if r.status_code != 200:
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        results = []
+        for c in soup.select("div.c-container, div.result"):
+            h3 = c.find("h3")
+            if not h3:
+                continue
+            a = h3.find("a")
+            if not a:
+                continue
+            title = a.get_text(strip=True)
+            url_ = a.get("href", "")
+            if not title or not url_.startswith(("http://", "https://")):
+                continue
+            # 百度 snippet 可能有多种 class, 依次尝试
+            snip_el = (
+                c.select_one('span[class*="content-right"]')
+                or c.select_one(".c-abstract")
+                or c.select_one('[class*="cos-line-clamp"]')
+                or c.select_one('div[class*="content"]')
+                or c.select_one(".c-span9")
+            )
+            snippet = ""
+            if snip_el:
+                snippet = snip_el.get_text(" ", strip=True)[:300]
+            # 兜底:如果 snippet 太短(<20 字), 退回到整个 container 的文本(去掉标题)
+            if len(snippet) < 20:
+                full = c.get_text(" ", strip=True)
+                if title in full:
+                    full = full.replace(title, "", 1).strip()
+                snippet = full[:300]
+            results.append({"title": title, "url": url_, "snippet": snippet})
+            if len(results) >= max_results:
+                break
+        return results
+    except Exception as e:
+        print(f"[Search] Baidu 失败: {e}")
+        return []
+
+
+def _sogou_search(query: str, max_results: int = 5):
+    """搜狗搜索(国内直连)."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+    try:
+        url = "https://www.sogou.com/web"
+        params = {"query": query}
+        r = requests.get(url, params=params, headers=_BROWSER_HEADERS, timeout=15)
+        if r.status_code != 200:
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        results = []
+        # 搜狗结果块有几种 class
+        containers = (soup.select(".vrwrap") or soup.select(".result") or soup.select("div.rb"))
+        for c in containers:
+            h3 = c.find("h3")
+            if not h3:
+                continue
+            a = h3.find("a")
+            if not a:
+                continue
+            title = a.get_text(strip=True)
+            url_ = a.get("href", "")
+            if url_.startswith("/"):
+                url_ = "https://www.sogou.com" + url_
+            if not title or not url_.startswith(("http://", "https://")):
+                continue
+            snip_el = (
+                c.select_one(".str_info")
+                or c.select_one(".fz-mid")
+                or c.select_one(".ft")
+                or c.select_one('[class*="text-layout"]')
+            )
+            snippet = ""
+            if snip_el:
+                snippet = snip_el.get_text(" ", strip=True)[:300]
+            if len(snippet) < 20:
+                full = c.get_text(" ", strip=True)
+                if title in full:
+                    full = full.replace(title, "", 1).strip()
+                snippet = full[:300]
+            results.append({"title": title, "url": url_, "snippet": snippet})
+            if len(results) >= max_results:
+                break
+        return results
+    except Exception as e:
+        print(f"[Search] Sogou 失败: {e}")
+        return []
+
+
 def _duckduckgo_search(query: str, max_results: int = 5):
     """
-    使用 DuckDuckGo HTML 版搜索(免费, 无需 Key).
+    DuckDuckGo HTML 版 — 国外可用, 国内通常不通.
     返回列表: [{"title": "", "url": "", "snippet": ""}]
     """
     try:
@@ -186,7 +349,7 @@ def _duckduckgo_search(query: str, max_results: int = 5):
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         }
-        r = requests.post(url, data=params, headers=headers, timeout=20)
+        r = requests.post(url, data=params, headers=headers, timeout=12)
         if r.status_code != 200:
             return []
 
@@ -261,24 +424,63 @@ def _bing_search(query: str, max_results: int = 5):
 @app.post("/api/web_search")
 def web_search(req: SearchRequest):
     """
-    web 搜索(短新闻用). 优先 Bing(如配Key),否则 DuckDuckGo.
-    返回: {query, results: [{title, url, snippet}], source}
+    web 搜索(短新闻/选题深化 用). 多源兜底:
+      1. Bing API (如配了 BING_SEARCH_KEY)
+      2. 必应国内版 cn.bing.com (国内可直连, 优先)
+      3. 百度 (国内兜底)
+      4. DuckDuckGo (国外兜底)
+    任一来源有结果就返回, 不继续尝试下一个.
+    返回: {query, results: [...], source, attempts: [...]}
     """
     print(f"[Search] 查询: {req.query}")
+    attempts = []  # 记录每个源的尝试结果
 
-    results = _bing_search(req.query, req.max_results)
-    source = "bing"
-    if not results:
-        results = _duckduckgo_search(req.query, req.max_results)
-        source = "duckduckgo"
+    # 1. Bing API (付费, 配了 Key 才用)
+    if os.getenv("BING_SEARCH_KEY"):
+        results = _bing_search(req.query, req.max_results)
+        attempts.append({"source": "bing_api", "count": len(results)})
+        if results:
+            print(f"[Search] ✓ bing_api 返回 {len(results)} 条")
+            return {"query": req.query, "results": results, "source": "bing_api",
+                    "count": len(results), "attempts": attempts}
 
-    print(f"[Search] 来源: {source}, 返回 {len(results)} 条")
-    return {
-        "query": req.query,
-        "results": results,
-        "source": source,
-        "count": len(results),
-    }
+    # 2. 必应国内版
+    results = _bing_cn_search(req.query, req.max_results)
+    attempts.append({"source": "bing_cn", "count": len(results)})
+    if results:
+        print(f"[Search] ✓ bing_cn 返回 {len(results)} 条")
+        return {"query": req.query, "results": results, "source": "bing_cn",
+                "count": len(results), "attempts": attempts}
+
+    # 3. 百度
+    results = _baidu_search(req.query, req.max_results)
+    attempts.append({"source": "baidu", "count": len(results)})
+    if results:
+        print(f"[Search] ✓ baidu 返回 {len(results)} 条")
+        return {"query": req.query, "results": results, "source": "baidu",
+                "count": len(results), "attempts": attempts}
+
+    # 4. 搜狗
+    results = _sogou_search(req.query, req.max_results)
+    attempts.append({"source": "sogou", "count": len(results)})
+    if results:
+        print(f"[Search] ✓ sogou 返回 {len(results)} 条")
+        return {"query": req.query, "results": results, "source": "sogou",
+                "count": len(results), "attempts": attempts}
+
+    # 5. DuckDuckGo
+    results = _duckduckgo_search(req.query, req.max_results)
+    attempts.append({"source": "duckduckgo", "count": len(results)})
+    if results:
+        print(f"[Search] ✓ duckduckgo 返回 {len(results)} 条")
+        return {"query": req.query, "results": results, "source": "duckduckgo",
+                "count": len(results), "attempts": attempts}
+
+    # 全部失败
+    print(f"[Search] ✗ 所有源都失败: {attempts}")
+    return {"query": req.query, "results": [], "source": "none",
+            "count": 0, "attempts": attempts,
+            "error": "所有搜索源均无结果或不可达(网络/被墙/解析失败)"}
 
 
 # ============================================================
@@ -413,7 +615,7 @@ if __name__ == "__main__":
     print(f"  AI Model     : {AI_MODEL or '(未设置)'}")
     print(f"  AI Base URL  : {AI_BASE_URL or '(未设置)'}")
     print(f"  AI Key 状态  : {'✓ 已配置 (' + AI_API_KEY[:8] + '...)' if AI_API_KEY else '✗ 未配置'}")
-    print(f"  Web Search   : ✓ DuckDuckGo(默认) {'+ Bing' if os.getenv('BING_SEARCH_KEY') else ''}")
+    print(f"  Web Search   : ✓ 必应国内版 + 百度 + DuckDuckGo{' + Bing API' if os.getenv('BING_SEARCH_KEY') else ''}")
     print(f"  监听地址     : http://localhost:8000")
     print(f"  健康检查     : http://localhost:8000/health")
     print("=" * 60)

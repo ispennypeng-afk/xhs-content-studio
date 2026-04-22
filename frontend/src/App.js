@@ -135,10 +135,15 @@ function cleanArticleText(md) {
   // v11: 增加更多实际出现的 cutoff 标记
   // 注意: 字符类里 [,，] 才是"半角逗号 + 全角逗号"
   const tailCutoffPatterns = [
+    // 【v17 新增】招聘相关
+    /^\s*招聘\s*[|｜]\s*(撰稿人|实习生|编辑|记者|编剧)/m,
+    /详细岗位要求点击跳转/,
+    /简历投递/,
+    /工作地点[:：][^\n]{0,30}(北京|上海|广州)/,
     // 【v11 新增】常见的引流/订阅收尾
-    /如果你和我们一样[,，][^\n]{0,50}(订阅|关注|买一本|杂志|感兴趣)/,
+    /如果你和我们一样[,,][^\n]{0,50}(订阅|关注|买一本|杂志|感兴趣)/,
     /更多精彩报道详见/,
-    /点击[下上]图[,，]?\s*一键下单/,
+    /点击[下上]图[,,]?\s*一键下单/,
     /开通三联数字刊年卡/,
     /让深度阅读再全一点/,
     /本周新刊/,
@@ -152,11 +157,11 @@ function cleanArticleText(md) {
     /三联生活周刊.{0,15}招撰稿人/,
     /[「"]这是一个什么群[」"]/,
     /大家都在看\s*\n/,
-    /欢迎文末分享[、,，]?\s*点赞[、,，]?\s*在看/,
-    /本文为原创内容[,，]?\s*版权归/,
+    /欢迎文末分享[、,,]?\s*点赞[、,,]?\s*在看/,
+    /本文为原创内容[,,]?\s*版权归/,
     /\*?本文为[「"]三联生活周刊[」"]原创内容/,
-    /未经许可[,，]\s*严禁复制[、,，]转载/,
-    /[""]点赞[""].?[""]在看[""][,，]?让更多人看到/,
+    /未经许可[,,]\s*严禁复制[、,,]转载/,
+    /[""]点赞[""].?[""]在看[""][,,]?让更多人看到/,
     /作为一家以[""]生活[""]命名的媒体/,
   ];
   for (const pat of tailCutoffPatterns) {
@@ -348,6 +353,15 @@ function parseArticleBlocks(md) {
       blocks.push({ type: "heading", level: 3, text: bm[1].trim() });
       continue;
     }
+    // v17: 编号式小标题 — "1. 突然坏掉的孩子" / "2. xxx" / "一、xxx" / "(一) xxx"
+    //   特征: 以数字或汉字编号开头 + 短文本(≤30 字)
+    const numberedHeading = t.match(/^(?:\d{1,2}[.、．)\)]\s*|[一二三四五六七八九十]{1,3}[、.．]\s*|[((][一二三四五六七八九十\d]{1,3}[))]\s*)(.{1,30})$/);
+    if (numberedHeading && !/[。!?;]$/.test(numberedHeading[1])) {
+      // 要求:标题内容不以句末标点结尾 (句末标点说明是正文句子,不是标题)
+      flushPara();
+      blocks.push({ type: "heading", level: 3, text: t });
+      continue;
+    }
     // 短句无标点 + 无空格 + 长度短 = 推定为小标题 (v10 修复: 真正作为 heading 输出)
     if (
       t.length >= 2 && t.length <= 16 &&
@@ -444,22 +458,31 @@ function extractAuthorInfo(md) {
   return null;
 }
 
+// v15: 严格按字符串前 10 位显示 pub_date, 不经过 new Date —— 避免时区偏移
+//      导致卡片显示的年份和筛选用的年份不一致(之前 bug: 选 2024 出来 2025 的)
 function formatPubDateToYM(dateStr) {
   if (!dateStr) return "";
-  try {
-    const d = new Date(dateStr);
-    if (isNaN(d.getTime())) return "";
-    return `${d.getFullYear()}年${d.getMonth() + 1}月`;
-  } catch { return ""; }
+  const s = String(dateStr);
+  const m = s.match(/^(\d{4})-(\d{2})/);
+  if (m) return `${m[1]}年${parseInt(m[2], 10)}月`;
+  return "";
 }
 
 function formatPubDate(dateStr) {
   if (!dateStr) return "";
-  try {
-    const d = new Date(dateStr);
-    if (isNaN(d.getTime())) return String(dateStr).slice(0, 10);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  } catch { return String(dateStr).slice(0, 10); }
+  const s = String(dateStr);
+  // 兼容 "2025-06-18", "2025-06-18T00:00:00Z", "2025-06-18 10:20:30+08:00"
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (m) return m[1];
+  return s.slice(0, 10);
+}
+
+// v15: 抽取年份(严格用前 4 位字符, 不经过 Date)
+function getPubYear(dateStr) {
+  if (!dateStr) return "";
+  const s = String(dateStr);
+  const m = s.match(/^(\d{4})/);
+  return m ? m[1] : "";
 }
 
 function formatNumber(n) {
@@ -627,11 +650,16 @@ async function saveGeneratedContent(payload) {
 }
 
 // v7: AI 匹配历史(持久化到 DB)
-async function saveMatchHistory({ long_recs, short_recs, weibo_batch_id, mode, custom_topic }) {
+async function saveMatchHistory({ long_recs, short_recs, weibo_batch_id, mode, custom_topic, topic_suggestions }) {
   try {
     const { error } = await supabase.from("ai_match_history").insert([{
       long_recs, short_recs, weibo_batch_id: weibo_batch_id || null,
-      note: JSON.stringify({ mode: mode || "auto", custom_topic: custom_topic || null }),
+      // v15: topic_suggestions 存到 note 的 JSON 里, 不需要加新字段
+      note: JSON.stringify({
+        mode: mode || "auto",
+        custom_topic: custom_topic || null,
+        topic_suggestions: topic_suggestions || [],
+      }),
     }]);
     if (error) {
       if (String(error.message || "").includes("does not exist")) {
@@ -749,7 +777,7 @@ function StatCard({ icon, label, value, color, sub }) {
           background: `${color}18`, display: "flex", alignItems: "center", justifyContent: "center",
           fontSize: 18,
         }}>{icon}</div>
-        <span style={{ fontSize: 13, color: palette.textSec, fontFamily: "'Noto Sans SC'" }}>{label}</span>
+        <span style={{ fontSize: 13, color: palette.textSec, fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif" }}>{label}</span>
       </div>
       <div style={{ fontSize: 28, fontWeight: 700, color: palette.text, fontFamily: "'Noto Serif SC'" }}>{value}</div>
       {sub && <div style={{ fontSize: 12, color: palette.textTri, marginTop: 6 }}>{sub}</div>}
@@ -794,7 +822,7 @@ function Tag({ children, color = palette.blue, onClick }) {
         display: "inline-block",
         padding: "5px 12px", borderRadius: 100,
         background: `${color}12`, color, fontSize: 12, fontWeight: 500,
-        fontFamily: "'Noto Sans SC'", cursor: onClick ? "pointer" : "default",
+        fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif", cursor: onClick ? "pointer" : "default",
         border: `1px solid ${color}25`,
       }}
     >{children}</span>
@@ -902,7 +930,7 @@ function XHSCoverLongForm({
       style={{
         width: W, height: H,
         background: "#FAFAF7", color: "#1A1A1A",
-        fontFamily: '"Noto Serif SC", "Songti SC", "SimSun", serif',
+        fontFamily: '"Noto Serif SC", "Songti SC", "SimSun", "宋体", "Microsoft YaHei", "微软雅黑", serif',
         padding: `${sp(38)}px ${sp(32)}px ${sp(28)}px`,
         display: "flex", flexDirection: "column",
         boxShadow: compactMode ? "none" : "0 8px 32px rgba(0,0,0,0.08)",
@@ -914,7 +942,7 @@ function XHSCoverLongForm({
       {/* 顶栏 三联logo */}
       <div style={{
         display: "flex", alignItems: "center", gap: sp(10), marginBottom: sp(14),
-        fontFamily: '"Noto Sans SC", sans-serif',
+        fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif',
       }}>
         <div style={{
           width: sp(38), height: sp(38), borderRadius: sp(8), background: palette.red,
@@ -941,7 +969,7 @@ function XHSCoverLongForm({
         <div style={{
           fontSize: sp(27), fontWeight: 800, lineHeight: 1.45,
           color: "#1A1A1A", letterSpacing: 0.3,
-          fontFamily: '"Noto Serif SC", serif',
+          fontFamily: '"Noto Serif SC", "Songti SC", "SimSun", "宋体", "Microsoft YaHei", "微软雅黑", serif',
           paddingLeft: 2,
         }}>{quote}</div>
         <div style={{
@@ -956,7 +984,7 @@ function XHSCoverLongForm({
       {showSubtitle && (
         <div style={{
           fontSize: sp(13.5), color: palette.textSec, lineHeight: 1.55,
-          fontFamily: '"Noto Sans SC", sans-serif', fontWeight: 500,
+          fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif', fontWeight: 500,
           paddingLeft: 2,
         }}>—《{articleTitle}》</div>
       )}
@@ -969,7 +997,7 @@ function XHSCoverLongForm({
         paddingTop: sp(12), borderTop: "1px solid #E5E5E0",
         textAlign: "center",
         fontSize: sp(11), color: palette.textTri, letterSpacing: 2,
-        fontFamily: '"Noto Sans SC", sans-serif',
+        fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif',
       }}>
         深度阅读 · {magazine}
       </div>
@@ -994,7 +1022,7 @@ function ShortNewsCover({
       style={{
         width: W, height: H,
         background: "#FAFAF7", color: "#1A1A1A",
-        fontFamily: '"Noto Serif SC", "Songti SC", "SimSun", serif',
+        fontFamily: '"Noto Serif SC", "Songti SC", "SimSun", "宋体", "Microsoft YaHei", "微软雅黑", serif',
         padding: `${sp(38)}px ${sp(32)}px ${sp(28)}px`,
         display: "flex", flexDirection: "column",
         boxShadow: compactMode ? "none" : "0 8px 32px rgba(0,0,0,0.08)",
@@ -1006,7 +1034,7 @@ function ShortNewsCover({
       {/* 顶栏 */}
       <div style={{
         display: "flex", alignItems: "center", gap: sp(10), marginBottom: sp(14),
-        fontFamily: '"Noto Sans SC", sans-serif',
+        fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif',
       }}>
         <div style={{
           width: sp(38), height: sp(38), borderRadius: sp(8), background: palette.red,
@@ -1033,7 +1061,7 @@ function ShortNewsCover({
         <div style={{
           fontSize: sp(26), fontWeight: 800, lineHeight: 1.42,
           color: "#1A1A1A", letterSpacing: 0.3,
-          fontFamily: '"Noto Serif SC", serif',
+          fontFamily: '"Noto Serif SC", "Songti SC", "SimSun", "宋体", "Microsoft YaHei", "微软雅黑", serif',
           paddingLeft: 2,
         }}>{title || "(标题)"}</div>
         <div style={{
@@ -1044,19 +1072,33 @@ function ShortNewsCover({
         }}>&rdquo;</div>
       </div>
 
-      {/* 摘要 */}
-      <div style={{
-        fontSize: sp(14.5), lineHeight: 1.9, color: "#2A2A2A",
-        flex: 1, overflow: "hidden", textAlign: "justify",
-        fontFamily: '"Noto Serif SC", "Songti SC", serif',
-      }}>{summary}</div>
+      {/* 摘要 - v15: 动态字号防溢出 + 行数硬上限 */}
+      {(() => {
+        const len = (summary || "").length;
+        // 超过 110 字就按比例降字号, 120+ 直接降到 12.5
+        let base = 14.5;
+        if (len > 150) base = 12;
+        else if (len > 130) base = 12.5;
+        else if (len > 110) base = 13.5;
+        return (
+          <div style={{
+            fontSize: sp(base), lineHeight: 1.85, color: "#2A2A2A",
+            flex: 1, overflow: "hidden", textAlign: "justify",
+            fontFamily: '"Noto Serif SC", "Songti SC", serif',
+            // v15: 最多 8 行, 多了会被 -webkit-box 自动省略号截断(可见截断好过悄悄吃掉)
+            display: "-webkit-box",
+            WebkitLineClamp: 8,
+            WebkitBoxOrient: "vertical",
+          }}>{summary}</div>
+        );
+      })()}
 
       {/* 底栏 */}
       <div style={{
         marginTop: sp(10), paddingTop: sp(12),
         borderTop: "1px solid #E5E5E0",
         fontSize: sp(11), color: "#888", textAlign: "center", letterSpacing: 2,
-        fontFamily: '"Noto Sans SC", sans-serif',
+        fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif',
       }}>深度阅读 · {magazine}</div>
     </div>
   );
@@ -1077,7 +1119,7 @@ function XHSContentPage({ innerRef, blocks, pageIndex, totalPages, showHeader, a
         padding: "34px 32px 0",
         paddingBottom: PAGE_NUM_AREA,
         background: "#FAFAF7", color: "#1A1A1A",
-        fontFamily: '"Noto Serif SC", "Songti SC", "SimSun", serif',
+        fontFamily: '"Noto Serif SC", "Songti SC", "SimSun", "宋体", "Microsoft YaHei", "微软雅黑", serif',
         display: "flex", flexDirection: "column",
         boxShadow: "0 8px 32px rgba(0,0,0,0.08)", borderRadius: 18,
         position: "relative", overflow: "hidden",
@@ -1089,11 +1131,11 @@ function XHSContentPage({ innerRef, blocks, pageIndex, totalPages, showHeader, a
         <div style={{ marginBottom: 14, paddingBottom: 12, borderBottom: "1px solid #E5E5E0", flexShrink: 0 }}>
           <div style={{
             fontSize: 22, fontWeight: 800, lineHeight: 1.38, color: "#1A1A1A",
-            fontFamily: '"Noto Serif SC", serif', marginBottom: 8,
+            fontFamily: '"Noto Serif SC", "Songti SC", "SimSun", "宋体", "Microsoft YaHei", "微软雅黑", serif', marginBottom: 8,
           }}>{articleTitle}</div>
           <div style={{
             fontSize: 12, color: "#888", letterSpacing: 0.5,
-            fontFamily: '"Noto Sans SC", sans-serif',
+            fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif',
           }}>三联生活周刊</div>
         </div>
       )}
@@ -1113,7 +1155,7 @@ function XHSContentPage({ innerRef, blocks, pageIndex, totalPages, showHeader, a
                 fontSize: fz, fontWeight: 700, color: "#1A1A1A",
                 marginTop: i === 0 ? 0 : 14, marginBottom: 8,
                 letterSpacing: 0.3, lineHeight: 1.5,
-                fontFamily: '"Noto Sans SC", -apple-system, sans-serif',
+                fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif',
               }}>{renderInlineMarkdown(b.text)}</div>
             );
           }
@@ -1134,7 +1176,7 @@ function XHSContentPage({ innerRef, blocks, pageIndex, totalPages, showHeader, a
           marginTop: 10, paddingTop: 10,
           borderTop: "1px solid #E5E5E0",
           fontSize: 12, color: "#666", lineHeight: 1.7,
-          fontFamily: '"Noto Sans SC", sans-serif', flexShrink: 0,
+          fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif', flexShrink: 0,
         }}>
           {authorLine.author && <div>{authorLine.author}</div>}
           {authorLine.source && <div style={{ fontStyle: "italic", color: "#888", marginTop: 2 }}>{authorLine.source}</div>}
@@ -1146,7 +1188,7 @@ function XHSContentPage({ innerRef, blocks, pageIndex, totalPages, showHeader, a
         position: "absolute", bottom: 20, left: 0, right: 0,
         textAlign: "center", fontSize: 11, color: "#B5B5B5",
         letterSpacing: 2,
-        fontFamily: '"Noto Sans SC", sans-serif',
+        fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif',
       }}>{pageIndex + 1} / {totalPages}</div>
     </div>
   );
@@ -1252,7 +1294,7 @@ function XHSNotePreview({
             position: "absolute", bottom: 10, right: 12,
             fontSize: 10, color: "#666", background: "rgba(255,255,255,0.9)",
             padding: "2px 8px", borderRadius: 8,
-            fontFamily: '"Noto Sans SC", sans-serif',
+            fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif',
             zIndex: 2,
           }}>1/N</div>
         </div>
@@ -1275,7 +1317,7 @@ function XHSNotePreview({
           }}>{caption}</div>
           <div style={{
             fontSize: 11, color: palette.textTri, marginTop: 4,
-            fontFamily: '"Noto Sans SC", sans-serif',
+            fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif',
           }}>... 展开</div>
         </div>
 
@@ -1508,7 +1550,7 @@ function HotTopicsPage({ weiboHot, loading, onRefresh }) {
               style={{
                 padding: "9px 14px", border: `1px solid ${palette.border}`,
                 borderRadius: 10, fontSize: 13, width: 240, outline: "none",
-                fontFamily: "'Noto Sans SC'", background: palette.card,
+                fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif", background: palette.card,
               }}
             />
             <Btn variant="secondary" onClick={onRefresh} disabled={loading}>
@@ -1586,11 +1628,11 @@ function HotTopicsPage({ weiboHot, loading, onRefresh }) {
                         <div style={{
                           fontSize: 12, fontWeight: 600, color: palette.red,
                           marginBottom: 10, letterSpacing: 0.5,
-                          fontFamily: "'Noto Sans SC'",
+                          fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
                         }}>🤖 AI 智搜摘要</div>
                         <div style={{
                           fontSize: 14, lineHeight: 2, color: palette.text,
-                          fontFamily: "'Noto Serif SC', serif",
+                          fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif",
                           padding: "14px 18px",
                           background: "#fff", borderRadius: 10,
                           border: `1px solid ${palette.border}`,
@@ -1637,7 +1679,7 @@ function ArticlesPage({ articles, loading, onRefresh, onOpenArticle }) {
   const years = useMemo(() => {
     const s = new Set();
     articles.forEach((a) => {
-      const y = (a.pub_date || "").slice(0, 4);
+      const y = getPubYear(a.pub_date);
       if (y && /^\d{4}$/.test(y)) s.add(y);
     });
     return ["all", ...[...s].sort().reverse()];
@@ -1645,7 +1687,7 @@ function ArticlesPage({ articles, loading, onRefresh, onOpenArticle }) {
 
   const filtered = useMemo(() => {
     let list = articles;
-    if (year !== "all") list = list.filter((a) => (a.pub_date || "").slice(0, 4) === year);
+    if (year !== "all") list = list.filter((a) => getPubYear(a.pub_date) === year);
     if (kw.trim()) {
       const k = kw.trim().toLowerCase();
       list = list.filter((a) =>
@@ -1670,7 +1712,7 @@ function ArticlesPage({ articles, loading, onRefresh, onOpenArticle }) {
               style={{
                 padding: "9px 12px", border: `1px solid ${palette.border}`,
                 borderRadius: 10, fontSize: 13, outline: "none",
-                background: palette.card, fontFamily: "'Noto Sans SC'",
+                background: palette.card, fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
               }}
             >
               {years.map((y) => <option key={y} value={y}>{y === "all" ? "全部年份" : `${y}年`}</option>)}
@@ -1681,7 +1723,7 @@ function ArticlesPage({ articles, loading, onRefresh, onOpenArticle }) {
               style={{
                 padding: "9px 14px", border: `1px solid ${palette.border}`,
                 borderRadius: 10, fontSize: 13, width: 240, outline: "none",
-                fontFamily: "'Noto Sans SC'", background: palette.card,
+                fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif", background: palette.card,
               }}
             />
             <Btn variant="secondary" onClick={onRefresh} disabled={loading}>
@@ -1726,7 +1768,7 @@ function ArticlesPage({ articles, loading, onRefresh, onOpenArticle }) {
             >
               <div style={{
                 fontSize: 11, color: palette.textTri, letterSpacing: 0.5,
-                fontFamily: "'Noto Sans SC'",
+                fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
               }}>{formatPubDate(a.pub_date)}</div>
               <div style={{
                 fontSize: 16, fontWeight: 700, color: palette.text,
@@ -1784,12 +1826,12 @@ function ArticleDetailPage({ article, onBack, onPickForGenerate }) {
         <h1 style={{
           fontSize: 32, fontWeight: 800, color: palette.text,
           margin: 0, marginBottom: 14, lineHeight: 1.4,
-          fontFamily: '"Noto Serif SC", serif',
+          fontFamily: '"Noto Serif SC", "Songti SC", "SimSun", "宋体", "Microsoft YaHei", "微软雅黑", serif',
         }}>{article.title}</h1>
         <div style={{
           fontSize: 13, color: palette.textTri, marginBottom: 30,
           paddingBottom: 20, borderBottom: `1px solid ${palette.border}`,
-          fontFamily: '"Noto Sans SC", sans-serif',
+          fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif',
         }}>
           三联生活周刊 · {formatPubDate(article.pub_date)}
           {author && <span> · {author}</span>}
@@ -1817,7 +1859,7 @@ function ArticleDetailPage({ article, onBack, onPickForGenerate }) {
               return (
                 <h3 key={i} style={{
                   fontSize: fz, fontWeight: 700, color: palette.text,
-                  margin: "32px 0 14px", fontFamily: '"Noto Sans SC", sans-serif',
+                  margin: "32px 0 14px", fontFamily: '"Noto Sans SC", -apple-system, "PingFang SC", "Microsoft YaHei", "微软雅黑", "SimHei", "黑体", sans-serif',
                 }}>{renderInlineMarkdown(b.text)}</h3>
               );
             }
@@ -1896,7 +1938,7 @@ function LongMatchCard({ rec, article, hotTopic, onPick }) {
         <div style={{ fontSize: 12, color: palette.textTri, marginBottom: 6, fontWeight: 500 }}>💡 推荐理由</div>
         <div style={{
           fontSize: 14, color: palette.text, lineHeight: 1.85,
-          fontFamily: "'Noto Serif SC', serif",
+          fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif",
         }}>{renderInlineMarkdown(rec.reason)}</div>
       </div>
 
@@ -1918,7 +1960,7 @@ function LongMatchCard({ rec, article, hotTopic, onPick }) {
               background: palette.cardAlt, borderRadius: 10,
               fontSize: 13, lineHeight: 1.85, color: palette.textSec,
               maxHeight: 260, overflowY: "auto",
-              fontFamily: "'Noto Serif SC', serif",
+              fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif",
             }}>
               {segmentSmartSummary(hotTopic.ai_summary).map((para, i) => (
                 <p key={i} style={{
@@ -1992,7 +2034,7 @@ function ShortMatchCard({ rec, hotTopic, onPick }) {
         <div style={{ fontSize: 12, color: palette.textTri, marginBottom: 6, fontWeight: 500 }}>💡 为什么适合做短新闻</div>
         <div style={{
           fontSize: 14, color: palette.text, lineHeight: 1.85,
-          fontFamily: "'Noto Serif SC', serif",
+          fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif",
         }}>{renderInlineMarkdown(rec.reason)}</div>
       </div>
 
@@ -2014,7 +2056,7 @@ function ShortMatchCard({ rec, hotTopic, onPick }) {
               background: palette.cardAlt, borderRadius: 10,
               fontSize: 13, lineHeight: 1.85, color: palette.textSec,
               maxHeight: 260, overflowY: "auto",
-              fontFamily: "'Noto Serif SC', serif",
+              fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif",
             }}>
               {segmentSmartSummary(hotTopic.ai_summary).map((para, i) => (
                 <p key={i} style={{
@@ -2036,15 +2078,118 @@ function ShortMatchCard({ rec, hotTopic, onPick }) {
   );
 }
 
-// AI 匹配主页
+// ============================================================
+// v15 新增: 深度报道选题建议卡片
+// ============================================================
+function TopicSuggestionCard({ suggestion, hotTopic, onPick }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!hotTopic) return null;
+
+  return (
+    <div style={{
+      background: palette.card, borderRadius: 16,
+      border: `1px solid ${palette.border}`, borderLeft: `4px solid ${palette.blue}`,
+      padding: 22, marginBottom: 14,
+    }}>
+      {/* 顶栏 */}
+      <div style={{
+        display: "flex", justifyContent: "space-between", alignItems: "flex-start",
+        marginBottom: 12, gap: 12, flexWrap: "wrap",
+      }}>
+        <div style={{
+          padding: "5px 12px", borderRadius: 100,
+          background: `${palette.blue}14`, color: palette.blue,
+          fontSize: 12, fontWeight: 700,
+        }}>
+          🔍 值得新写的深度选题
+        </div>
+        <Pill color="#FFF2E4" textColor={palette.orange}>
+          🔥 源自热搜: {hotTopic.title?.slice(0, 28)}{hotTopic.title?.length > 28 ? "..." : ""}
+        </Pill>
+      </div>
+
+      {/* 选题一句话 */}
+      <div style={{
+        fontSize: 17, fontWeight: 700, color: palette.text, lineHeight: 1.45,
+        fontFamily: "'Noto Serif SC'", marginBottom: 10,
+      }}>{suggestion.topic || "(未命名选题)"}</div>
+
+      {/* 为什么要新写 */}
+      {suggestion.why_new && (
+        <div style={{
+          padding: "10px 14px", background: palette.warm, borderRadius: 10,
+          marginBottom: 12, fontSize: 13, lineHeight: 1.85, color: palette.textSec,
+          fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif",
+        }}>
+          <span style={{ fontWeight: 700, color: palette.blue }}>为什么需要新写 · </span>
+          {suggestion.why_new}
+        </div>
+      )}
+
+      {/* 可切入角度 */}
+      {suggestion.angles && suggestion.angles.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 12, color: palette.textTri, marginBottom: 6, fontWeight: 500 }}>💡 可切入角度</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {suggestion.angles.map((a, i) => (
+              <div key={i} style={{
+                fontSize: 13.5, color: palette.text, lineHeight: 1.75,
+                paddingLeft: 10, borderLeft: `2px solid ${palette.blue}40`,
+                fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+              }}>{a}</div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 展开热搜原文 */}
+      {hotTopic.ai_summary && (
+        <div style={{ marginBottom: 12 }}>
+          <div
+            onClick={() => setExpanded(!expanded)}
+            style={{
+              fontSize: 12, color: palette.blue, cursor: "pointer",
+              display: "inline-flex", alignItems: "center", gap: 4, fontWeight: 500,
+            }}
+          >
+            {expanded ? "▼" : "▶"} {expanded ? "收起" : "展开"} 热搜 AI 智搜详情
+          </div>
+          {expanded && (
+            <div style={{
+              marginTop: 8, padding: "12px 16px",
+              background: palette.cardAlt, borderRadius: 10,
+              fontSize: 12.5, lineHeight: 1.85, color: palette.textSec,
+              maxHeight: 240, overflowY: "auto",
+              fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+            }}>
+              {segmentSmartSummary(hotTopic.ai_summary).map((para, i) => (
+                <p key={i} style={{ margin: i === 0 ? 0 : "10px 0 0 0" }}>
+                  {renderInlineMarkdown(para)}
+                </p>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+        <Btn variant="secondary" onClick={() => onPick(suggestion, hotTopic)}>
+          📝 深化选题 → 搜索资料 + 访谈提纲
+        </Btn>
+      </div>
+    </div>
+  );
+}
 function MatchPage({
-  articles, weiboHot, onPickLongForm, onPickShortNews,
+  articles, weiboHot, onPickLongForm, onPickShortNews, onPickTopicSuggestion,
   longRecs, setLongRecs, shortRecs, setShortRecs,
+  topicSuggestions, setTopicSuggestions,
   lastMatchedAt, setLastMatchedAt, activeTab: tabProp, setActiveTab: setTabProp,
   matchHistory, reloadMatchHistory,
 }) {
   const toast = useToast();
   const [loading, setLoading] = useState(false);
+  const [progressMsg, setProgressMsg] = useState("");  // v15: 两阶段匹配进度
   // 如果父层没传 tab 控制, 用本地 state 兜底
   const [localTab, setLocalTab] = useState("long");
   const activeTab = tabProp ?? localTab;
@@ -2057,56 +2202,156 @@ function MatchPage({
   const [showHistory, setShowHistory] = useState(false);
   const [historyDateFilter, setHistoryDateFilter] = useState("all");  // all/today/week
 
+  // v15: 两阶段匹配 —— 召回+精排
   const runMatch = async () => {
-    // 按模式取不同数据源
-    let hotForAI, articlesForAI;
-    if (mode === "auto") {
-      if (weiboHot.length === 0) { toast("还没有微博热搜数据,请先到仪表盘启动爬虫", "warning"); return; }
-      if (articles.length === 0) { toast("文章库是空的", "warning"); return; }
-      articlesForAI = articles.slice(0, 500).map((a) => ({
-        id: a.id, title: a.title,
-        summary: (a.summary || "").slice(0, 200),
-        date: formatPubDate(a.pub_date),
-      }));
-      hotForAI = weiboHot.map((h, idx) => ({
-        idx, rank: h.rank, title: h.title,
-        summary: (h.ai_summary || "").slice(0, 400),
-      }));
-    } else if (mode === "custom_topic") {
-      if (!customTopic.title.trim()) { toast("请输入自选话题标题", "warning"); return; }
-      if (articles.length === 0) { toast("文章库是空的", "warning"); return; }
-      articlesForAI = articles.slice(0, 500).map((a) => ({
-        id: a.id, title: a.title,
-        summary: (a.summary || "").slice(0, 200),
-        date: formatPubDate(a.pub_date),
-      }));
-      hotForAI = [{
-        idx: 0, rank: 0, title: customTopic.title,
-        summary: customTopic.summary || "",
-      }];
-    } else {
-      // custom_article 不需要 AI 匹配, 直接跳转生成
+    // ==========================================================
+    // 前置准备
+    // ==========================================================
+    if (mode === "custom_article") {
+      // 自选文章不需要匹配, 直接进入生成
       if (!customArticle.title.trim() || !customArticle.content.trim()) {
         toast("请填写自选文章的标题和正文", "warning"); return;
       }
       const pseudoArticle = {
-        id: -Date.now(),  // 用负数标识自选
+        id: -Date.now(),
         title: customArticle.title,
         content_md: customArticle.content,
         summary: customArticle.content.slice(0, 150),
         pub_date: customArticle.pub_date || new Date().toISOString(),
       };
       const pseudoTopic = customTopic.title.trim() ? {
-        title: customTopic.title,
-        ai_summary: customTopic.summary,
+        title: customTopic.title, ai_summary: customTopic.summary,
       } : null;
       onPickLongForm(pseudoArticle, pseudoTopic);
       return;
     }
 
+    if (mode === "auto") {
+      if (weiboHot.length === 0) { toast("还没有微博热搜数据,请先到仪表盘启动爬虫", "warning"); return; }
+      if (articles.length === 0) { toast("文章库是空的", "warning"); return; }
+    } else if (mode === "custom_topic") {
+      if (!customTopic.title.trim()) { toast("请输入自选话题标题", "warning"); return; }
+      if (articles.length === 0) { toast("文章库是空的", "warning"); return; }
+    }
+
     setLoading(true);
+    setProgressMsg("准备数据...");
+
     try {
-      const systemMsg = "你是《三联生活周刊》小红书账号的内容编辑,深度理解三联的严肃、人文、关怀导向。你善于把当下热点与三联历史文章联系起来,为官方账号挑选既贴合热点又能提供思想增量的内容。";
+      // 热点数据 —— 喂完整的 ai_summary(不再截断到 400 字)
+      const hotForAI = mode === "auto"
+        ? weiboHot.map((h, idx) => ({
+            idx, rank: h.rank, title: h.title,
+            summary: (h.ai_summary || "").slice(0, 1200),  // v15: 400→1200
+          }))
+        : [{
+            idx: 0, rank: 0, title: customTopic.title,
+            summary: customTopic.summary || "",
+          }];
+
+      // ==========================================================
+      // 阶段 1:召回 —— 从全量文章库里召回 Top 60
+      // v15 核心修复:从 articles.slice(0, 500) 改为全库
+      // ==========================================================
+      setProgressMsg(`阶段 1/2: 从 ${articles.length} 篇全库中召回候选...`);
+
+      // 给召回阶段的轻量摘要(每篇只带 ID+标题+日期+70字摘要)
+      const recallPool = articles.map((a) => ({
+        id: a.id,
+        title: a.title,
+        date: formatPubDate(a.pub_date),
+        summary: (a.summary || "").slice(0, 70),
+      }));
+
+      // 把召回池分批(每批 700 篇左右)送 AI, 每批取 top 20, 合并去重
+      const BATCH_SIZE = 700;
+      const TOP_PER_BATCH = 20;
+      const batches = [];
+      for (let i = 0; i < recallPool.length; i += BATCH_SIZE) {
+        batches.push(recallPool.slice(i, i + BATCH_SIZE));
+      }
+
+      const hotBriefForRecall = hotForAI.map((h) =>
+        `[${h.idx}] ${h.title}${h.summary ? " — " + h.summary.slice(0, 200) : ""}`
+      ).join("\n");
+
+      const recallIds = new Set();
+      const recallScores = new Map(); // id -> 最高分
+
+      for (let bi = 0; bi < batches.length; bi++) {
+        setProgressMsg(`阶段 1/2: 扫描文章库 ${bi + 1}/${batches.length} 批...`);
+        const batch = batches[bi];
+        const recallPrompt = `你是三联生活周刊的内容编辑。下面有一批历史文章和一些今日热搜。请从文章库中挑出最有可能与任一热搜形成深度共鸣的文章。
+
+【热搜列表】
+${hotBriefForRecall}
+
+【文章库批次 ${bi + 1}/${batches.length} (共 ${batch.length} 篇)】
+${batch.map((a) => `ID=${a.id} | ${a.date} | 《${a.title}》${a.summary ? " — " + a.summary : ""}`).join("\n")}
+
+任务:从这批文章中找出 ${TOP_PER_BATCH} 篇最可能匹配任一热搜的文章。
+标准:
+- 两者必须有具体的共同话题(不是"都涉及社会"这种空话)
+- 优先同一现象/同一群体/同一议题的直接对应
+- 标题和摘要里有关键词或议题呼应的更优先
+
+严格只返回 JSON,不加 markdown 标记:
+{"candidates":[{"id":123,"score":0.85,"hot_idx":2},{"id":456,"score":0.80,"hot_idx":0}]}
+
+score 为初步评分 0-1, hot_idx 是你认为最相关的那条热搜的 idx。只返回你真觉得有潜力的,宁少勿多。`;
+
+        try {
+          const resp = await callAI(recallPrompt, {
+            system: "你是一位资深新闻编辑,擅长快速浏览文章标题和摘要,判断哪些和当下热点相关。只返回 JSON。",
+            maxTokens: 2000, temperature: 0.3,
+          });
+          let cleaned = resp.trim().replace(/^```json\s*/, "").replace(/\s*```$/, "").replace(/^```\s*/, "");
+          let parsed;
+          try { parsed = JSON.parse(cleaned); }
+          catch {
+            const s = cleaned.indexOf("{"), e = cleaned.lastIndexOf("}");
+            parsed = JSON.parse(cleaned.slice(s, e + 1));
+          }
+          for (const c of (parsed.candidates || [])) {
+            if (c.id === undefined) continue;
+            recallIds.add(c.id);
+            const prev = recallScores.get(c.id) || 0;
+            if ((c.score || 0) > prev) recallScores.set(c.id, c.score || 0);
+          }
+        } catch (e) {
+          console.warn(`批次 ${bi + 1} 召回失败, 跳过:`, e);
+        }
+      }
+
+      // 按评分排序,最多保留 60 篇做精排
+      const candidateIds = [...recallIds].sort((a, b) =>
+        (recallScores.get(b) || 0) - (recallScores.get(a) || 0)
+      ).slice(0, 60);
+
+      if (candidateIds.length === 0) {
+        toast("召回阶段没找到候选文章,可能是热搜主题都比较边缘。可尝试切换到「自选话题」模式", "warning");
+        setLoading(false); setProgressMsg("");
+        return;
+      }
+
+      // ==========================================================
+      // 阶段 2:精排 —— 把 60 篇的正文前 2500 字送给 AI 做深度匹配
+      // + 同时识别出"值得深度报道但没有合适旧文"的热搜(选题建议)
+      // ==========================================================
+      setProgressMsg(`阶段 2/2: 精排 ${candidateIds.length} 篇候选(含正文)...`);
+
+      const articlesForAI = candidateIds.map((id) => {
+        const a = articles.find((x) => x.id === id);
+        if (!a) return null;
+        // 取正文前 2500 字 + 标题摘要日期
+        return {
+          id: a.id,
+          title: a.title,
+          date: formatPubDate(a.pub_date),
+          summary: (a.summary || "").slice(0, 150),
+          body: (a.content_md || "").slice(0, 2500),
+        };
+      }).filter(Boolean);
 
       const shortNewsInstruction = mode === "auto"
         ? `任务2 · 短新闻推荐 (3-5 条):
@@ -2115,51 +2360,74 @@ function MatchPage({
 - 信息密度高、有时效
 - 三联受众(关心公共议题、文化、深度话题的人)会感兴趣
 - 回避: 纯娱乐/情绪/需要长文阐述的复杂议题`
-        : `任务2 · 短新闻推荐: 自选话题模式下,不需要生成短新闻推荐,short_news 返回空数组 []`;
+        : `任务2 · 短新闻推荐: 自选话题模式下不适用, short_news 返回空数组 []`;
 
-      const prompt = `下面有两份资料:
+      const topicSuggestInstruction = mode === "auto"
+        ? `任务3 · 深度报道选题建议 (2-4 条):
+从今日热搜中挑出【同时满足以下全部条件】的:
+(a) 有深度报道价值 —— 涉及结构性问题、多方观点、社会趋势、新现象
+(b) 档案库里【没有】真正匹配的旧文 —— 这是一个【新兴议题/全新事件】,既存文章无法回应
+(c) 本身是新的、值得三联记者出门采访的选题 —— 而不是老生常谈
 
-【A. ${mode === "auto" ? "今日微博热搜" : "自选话题"}】
-${hotForAI.map((h) => `[${h.idx}] ${mode === "auto" ? "排名" + h.rank + " | " : ""}${h.title}\n  摘要: ${h.summary || "无"}`).join("\n\n")}
+这是在提示编辑部:这些话题值得新写,不是重发旧文能解决的。
 
-【B. 三联生活周刊历史文章库(最近500篇)】
-${articlesForAI.map((a) => `ID=${a.id} | ${a.date} | 《${a.title}》\n  摘要: ${a.summary || "无"}`).join("\n\n")}
+每条建议给出:
+- 核心议题(一句话点明要写什么)
+- 3 个可切入角度
+- 建议采访对象类型(不写具体人名, 写"某某领域的从业者/研究者"等)
+- 3-5 个关键访谈问题`
+        : `任务3 · 深度报道选题建议: 自选话题模式下不适用, topic_suggestions 返回空数组 []`;
 
-任务: 同时完成两件事:
+      const mainPrompt = `下面有两份资料:
 
-任务1 · 长文推荐 (${mode === "auto" ? "3-5 篇" : "5-8 篇"}):
-从历史文章库挑若干篇,${mode === "auto" ? "每篇要和某一条热搜形成深度呼应——当下事件触发,旧文给出思想背景或人文视角" : "和自选话题形成深度呼应"}。
+【A. ${mode === "auto" ? `今日微博热搜(${hotForAI.length} 条, 每条含完整 AI 智搜详情)` : "自选话题"}】
+${hotForAI.map((h) => `[${h.idx}] ${mode === "auto" ? "排名" + h.rank + " | " : ""}${h.title}
+  AI 智搜详情: ${h.summary || "无"}`).join("\n\n")}
 
-【匹配的铁律】:
-1. **话题真相关**——文章和热点必须有一个明确、具体的共同话题,而不是泛泛的"都讨论社会"。
-   ❌ 错误示范: 热点是"日本军舰经台海" + 文章是"伊朗国宝在战火中来到中国" → 理由硬扯"都涉及战争与文化记忆"。实际上一个讲地缘挑衅,一个讲文物抢救,不相关。
-   ✓ 正确示范: 热点是"游神仪式走红" + 文章是"年轻人扎堆去看游神" → 都在讲同一现象,直接对应。
-   
-2. **越直接越好**——如果有两篇文章都能勉强对应热点,优先选那篇话题**直接**的。不要为了"有深度"而选远的。
+【B. 三联历史文章候选池(${articlesForAI.length} 篇,含正文节选)】
+${articlesForAI.map((a) => `--- ID=${a.id} | ${a.date} ---
+《${a.title}》
+摘要: ${a.summary || "无"}
+正文节选(前 2500 字): ${a.body.slice(0, 2500) || "(正文缺失)"}`).join("\n\n")}
 
-3. **内容真实对应**——仔细读热点摘要和文章摘要,确认两者的核心事件/人物/主题有实际重叠。
+任务:完成三件事:
 
-4. **保守起见,宁缺勿滥**——如果一条热搜找不到合适文章,**不要推荐**。宁可少给 2 条,不要给 5 条牵强的。${mode === "auto" ? "热搜有 50 条,从中挑 3-5 条**真能匹配的**就够了。" : ""}
+任务1 · 长文推荐 (${mode === "auto" ? "3-5 篇, 每篇对应一条热搜" : "3-5 篇"}):
+从候选池挑若干篇,${mode === "auto" ? "每篇要和某一条热搜形成深度呼应 —— 当下事件触发,旧文给出思想背景或人文视角" : "和自选话题形成深度呼应"}。
 
-5. **match_score 标准**: 
-   - 0.9+ = 文章核心议题 = 热搜核心议题(同一事件/同一现象)
-   - 0.8-0.9 = 文章议题和热搜议题是同一母题的不同侧面
-   - 0.7-0.8 = 文章能从一个角度回应热搜,但不完全对应
-   - < 0.7 = **别推荐**
+【匹配铁律】:
+1. **话题真相关** —— 文章和热点必须有一个明确、具体的共同话题。仔细读热搜的 AI 智搜详情(里面有事件脉络、争议焦点、多方观点),以及文章的正文节选(不只看摘要)。
+   ❌ 错误示范: 热搜"灵魂摆渡电影全AI生成"(议题:AI 能否替代演员,创作的灵魂边界) + 文章"转行后她做出亿级播放的爆款剧"(议题:个人职业转型) → 理由硬扯"技术越先进人的价值越大"。两者其实不是同一个问题。
+   ✓ 正确示范: 热搜"灵魂摆渡电影全AI生成"(AI 艺术创作边界/就业冲击) + 一篇讨论过 AI 与创作者关系的旧文 → 直接对应。
 
-- 话题价值: 优先社会议题、性别、劳动、城市、代际、公共事件; 回避纯娱乐八卦
-- 时宜性: 文章内容现在读是否仍有相关性
+2. **读完正文再判断** —— 推荐理由里**必须引用正文的具体段落或具体细节**(人物、场景、观点),不要只复述摘要。如果只能引用摘要,说明你没读正文 —— 这种推荐不要给。
+
+3. **越直接越好** —— 两篇都能勉强对应时,优先话题最直接的那篇。不要"为有深度而选远的"。
+
+4. **宁缺勿滥** —— 一条热搜找不到真合适的文章就【不要推荐】。宁可一共只给 3 条,不要给 5 条牵强的。
+
+5. **同一条热搜可以匹配 2 篇**,前提是这两篇文章确实从不同角度回应了同一热搜(比如一篇讲现象、一篇讲个案)。但必须**每篇单独都能通过铁律 1-3 的检验**。
+
+6. **match_score 校准**:
+   - 0.90+ = 文章核心议题 ≈ 热搜核心议题(同一事件/同一现象/同一争议)
+   - 0.80-0.90 = 文章从侧面直接回应热搜议题
+   - 0.70-0.80 = 能呼应但不完全对应
+   - < 0.70 = **不要推荐**
+
+7. **时间优先级**: 文章发表日期不重要,内容是否仍然能回应今天的热搜才重要。不要偏心最近一年的文章,老文章如果更对应应优先。
 
 ${shortNewsInstruction}
 
-严格只返回 JSON,不加 markdown 代码块标记:
+${topicSuggestInstruction}
+
+严格只返回 JSON,不加任何 markdown 代码块标记:
 {
   "recommended_articles": [
     {
       "article_id": 123,
       "hot_topic_idx": 0,
-      "match_score": 0.85,
-      "reason": "200-300 字中文。**首句就点明两者的共同话题是什么**,然后说文章给出了怎样的深入视角。不要打空话(如'体现了三联的人文关怀'),要具体到事实对应"
+      "match_score": 0.88,
+      "reason": "300-400 字中文。**首句必须点明两者的共同核心议题是什么**。接着引用文章正文里的具体段落或细节(必须是正文,不能只用摘要),说明它如何回应热搜里的某个具体观点/争议。最后说这个回应对小红书读者的增量价值。不要打空话(如'体现三联人文关怀')"
     }
   ],
   "short_news": [
@@ -2168,12 +2436,25 @@ ${shortNewsInstruction}
       "suitability": 0.9,
       "reason": "100-180 字中文,说清为什么这条热搜适合做成短新闻"
     }
+  ],
+  "topic_suggestions": [
+    {
+      "hot_topic_idx": 7,
+      "topic": "一句话点明要写的选题",
+      "why_new": "60-100 字,说明为什么这是需要新写的(而不是可以用旧文回应的)",
+      "angles": ["角度1: xxx", "角度2: xxx", "角度3: xxx"],
+      "interview_targets": ["采访对象类型1,如:从事AI影视后期的一线从业者", "采访对象类型2", "采访对象类型3"],
+      "key_questions": ["关键问题1", "关键问题2", "关键问题3", "关键问题4"]
+    }
   ]
 }`;
 
-      const resp = await callAI(prompt, { system: systemMsg, maxTokens: 4000, temperature: 0.7 });
-      let cleaned = resp.trim()
-        .replace(/^```json\s*/, "").replace(/\s*```$/, "").replace(/^```\s*/, "");
+      const systemMsg = "你是《三联生活周刊》的资深编辑,特别擅长从热搜的多方观点中抓住真问题,然后在浩瀚档案里找到真正对应的旧文。你非常讨厌牵强附会的匹配。只返回 JSON。";
+
+      const resp = await callAI(mainPrompt, {
+        system: systemMsg, maxTokens: 6000, temperature: 0.5,
+      });
+      let cleaned = resp.trim().replace(/^```json\s*/, "").replace(/\s*```$/, "").replace(/^```\s*/, "");
       let parsed;
       try { parsed = JSON.parse(cleaned); }
       catch {
@@ -2181,23 +2462,30 @@ ${shortNewsInstruction}
         if (s >= 0 && e > s) parsed = JSON.parse(cleaned.slice(s, e + 1));
         else throw new Error("AI 返回不是有效 JSON");
       }
+
       const longs = parsed.recommended_articles || [];
       const shorts = parsed.short_news || [];
+      const suggestions = parsed.topic_suggestions || [];
+
       setLongRecs(longs);
       setShortRecs(shorts);
+      setTopicSuggestions(suggestions);
       setLastMatchedAt(new Date());
-      toast(`匹配完成: ${longs.length} 篇长文 + ${shorts.length} 条短新闻`, "success");
+      setProgressMsg("");
+      toast(`✅ 匹配完成: ${longs.length} 篇长文 · ${shorts.length} 条短新闻 · ${suggestions.length} 个选题建议`, "success");
 
       // 【v7】保存到 DB
       const saved = await saveMatchHistory({
         long_recs: longs, short_recs: shorts,
         mode,
         custom_topic: mode === "custom_topic" ? customTopic : null,
+        topic_suggestions: suggestions,  // v15: 新增
       });
       if (saved && reloadMatchHistory) reloadMatchHistory();
     } catch (e) {
       console.error(e);
       toast(`AI 匹配失败: ${e.message}`, "error");
+      setProgressMsg("");
     } finally {
       setLoading(false);
     }
@@ -2207,6 +2495,11 @@ ${shortNewsInstruction}
   const restoreHistory = (h) => {
     setLongRecs(h.long_recs || []);
     setShortRecs(h.short_recs || []);
+    // v15: 从 note 里取 topic_suggestions(如有)
+    try {
+      const meta = JSON.parse(h.note || "{}");
+      setTopicSuggestions(meta.topic_suggestions || []);
+    } catch { setTopicSuggestions([]); }
     setLastMatchedAt(new Date(h.matched_at));
     setShowHistory(false);
     toast(`已载入 ${fmtBeijing(h.matched_at)} 的匹配结果`, "success");
@@ -2262,7 +2555,7 @@ ${shortNewsInstruction}
               textAlign: "center", transition: "all .15s",
               background: mode === m.key ? gradPrimary : "transparent",
               color: mode === m.key ? "#fff" : palette.textSec,
-              fontFamily: "'Noto Sans SC'",
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
             }}>
             <div style={{ fontSize: 13, fontWeight: 600 }}>{m.label}</div>
             <div style={{ fontSize: 10.5, opacity: 0.85, marginTop: 2 }}>{m.desc}</div>
@@ -2286,7 +2579,7 @@ ${shortNewsInstruction}
             style={{
               width: "100%", padding: "10px 14px", fontSize: 14,
               border: `1px solid ${palette.borderMed}`, borderRadius: 8, marginBottom: 10,
-              fontFamily: "'Noto Sans SC'", outline: "none", boxSizing: "border-box",
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif", outline: "none", boxSizing: "border-box",
             }}
           />
           <textarea
@@ -2297,7 +2590,7 @@ ${shortNewsInstruction}
             style={{
               width: "100%", padding: "10px 14px", fontSize: 13,
               border: `1px solid ${palette.borderMed}`, borderRadius: 8,
-              fontFamily: "'Noto Sans SC'", outline: "none", boxSizing: "border-box", resize: "vertical",
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif", outline: "none", boxSizing: "border-box", resize: "vertical",
             }}
           />
         </div>
@@ -2319,7 +2612,7 @@ ${shortNewsInstruction}
             style={{
               width: "100%", padding: "10px 14px", fontSize: 14,
               border: `1px solid ${palette.borderMed}`, borderRadius: 8, marginBottom: 10,
-              fontFamily: "'Noto Sans SC'", outline: "none", boxSizing: "border-box",
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif", outline: "none", boxSizing: "border-box",
             }}
           />
           <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
@@ -2330,7 +2623,7 @@ ${shortNewsInstruction}
               style={{
                 flex: 1, padding: "10px 14px", fontSize: 13,
                 border: `1px solid ${palette.borderMed}`, borderRadius: 8,
-                fontFamily: "'Noto Sans SC'", outline: "none", boxSizing: "border-box",
+                fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif", outline: "none", boxSizing: "border-box",
               }}
             />
             <label style={{
@@ -2362,7 +2655,7 @@ ${shortNewsInstruction}
             style={{
               width: "100%", padding: "12px 14px", fontSize: 13, lineHeight: 1.8,
               border: `1px solid ${palette.borderMed}`, borderRadius: 8,
-              fontFamily: "'Noto Serif SC', serif", outline: "none", boxSizing: "border-box", resize: "vertical",
+              fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif", outline: "none", boxSizing: "border-box", resize: "vertical",
             }}
           />
           <div style={{ marginTop: 12, padding: 12, background: palette.cardAlt, borderRadius: 8, fontSize: 12, color: palette.textSec }}>
@@ -2376,7 +2669,7 @@ ${shortNewsInstruction}
               style={{
                 width: "100%", marginTop: 10, padding: "9px 14px", fontSize: 13,
                 border: `1px solid ${palette.borderMed}`, borderRadius: 8,
-                fontFamily: "'Noto Sans SC'", outline: "none", boxSizing: "border-box",
+                fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif", outline: "none", boxSizing: "border-box",
               }}
             />
           )}
@@ -2405,7 +2698,7 @@ ${shortNewsInstruction}
                     background: historyDateFilter === f.key ? palette.red : "transparent",
                     color: historyDateFilter === f.key ? "#fff" : palette.textSec,
                     border: `1px solid ${historyDateFilter === f.key ? palette.red : palette.border}`,
-                    fontFamily: "'Noto Sans SC'",
+                    fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
                   }}>{f.label}</div>
               ))}
             </div>
@@ -2488,26 +2781,32 @@ ${shortNewsInstruction}
             fontFamily: "'Noto Serif SC'", color: palette.text,
           }}>✨ AI 正在分析热点与文章...</div>
           <div style={{ fontSize: 13, color: palette.textTri, marginTop: 8 }}>
-            预计需要 20-40 秒
+            {progressMsg || "两阶段匹配中,预计 60-90 秒"}
           </div>
+          {progressMsg && (
+            <div style={{ fontSize: 11.5, color: palette.textTri, marginTop: 4 }}>
+              先从全库召回候选,再读正文精排 → 匹配质量更高
+            </div>
+          )}
         </div>
       )}
 
-      {!loading && longRecs.length === 0 && shortRecs.length === 0 && (
+      {!loading && longRecs.length === 0 && shortRecs.length === 0 && (topicSuggestions || []).length === 0 && (
         <EmptyState
           icon="✨"
           title="等待 AI 匹配"
-          desc="点击右上角「开始 AI 匹配」按钮,AI 会同时给出长文推荐和短新闻推荐"
+          desc="点击右上角「开始 AI 匹配」按钮,AI 会给出长文推荐、短新闻推荐和深度报道选题建议"
         />
       )}
 
-      {!loading && (longRecs.length > 0 || shortRecs.length > 0) && (
+      {!loading && (longRecs.length > 0 || shortRecs.length > 0 || (topicSuggestions || []).length > 0) && (
         <>
           {/* Tab 切换 */}
           <div style={{ display: "flex", gap: 4, marginBottom: 18, borderBottom: `1px solid ${palette.border}` }}>
             {[
               { key: "long", label: `📖 长文推荐 (${longRecs.length})`, color: palette.red },
               { key: "short", label: `⚡ 短新闻推荐 (${shortRecs.length})`, color: palette.purple },
+              { key: "suggest", label: `🔍 深度报道选题 (${(topicSuggestions || []).length})`, color: palette.blue },
             ].map((t) => (
               <div
                 key={t.key}
@@ -2518,7 +2817,7 @@ ${shortNewsInstruction}
                   color: activeTab === t.key ? t.color : palette.textSec,
                   borderBottom: activeTab === t.key ? `3px solid ${t.color}` : "3px solid transparent",
                   marginBottom: -1, transition: "all 0.15s",
-                  fontFamily: "'Noto Sans SC'",
+                  fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
                 }}
               >{t.label}</div>
             ))}
@@ -2551,6 +2850,24 @@ ${shortNewsInstruction}
                   <ShortMatchCard
                     key={i} rec={rec} hotTopic={hotTopic}
                     onPick={onPickShortNews}
+                  />
+                );
+              })}
+            </div>
+          )}
+
+          {activeTab === "suggest" && (
+            <div>
+              {(topicSuggestions || []).length === 0 ? (
+                <div style={{ textAlign: "center", padding: 40, color: palette.textTri }}>
+                  暂无选题建议(AI 本次匹配中未识别出需要新写的深度选题)
+                </div>
+              ) : (topicSuggestions || []).map((sug, i) => {
+                const hotTopic = weiboHot[sug.hot_topic_idx];
+                return (
+                  <TopicSuggestionCard
+                    key={i} suggestion={sug} hotTopic={hotTopic}
+                    onPick={onPickTopicSuggestion}
                   />
                 );
               })}
@@ -2678,7 +2995,7 @@ function DashboardPage({ articles, weiboHot, genHistory, backend, onStartCrawler
             style={{
               padding: "8px 12px", border: `1px solid ${palette.border}`,
               borderRadius: 8, fontSize: 13, outline: "none", background: palette.card,
-              fontFamily: "'Noto Sans SC'",
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
             }}
           >
             {[10, 20, 30, 40, 50].map((n) => <option key={n} value={n}>{n} 条</option>)}
@@ -2699,7 +3016,7 @@ function DashboardPage({ articles, weiboHot, genHistory, backend, onStartCrawler
               padding: "10px 20px", borderRadius: 12, cursor: "pointer",
               background: palette.warm, color: palette.text,
               border: `1px solid ${palette.borderMed}`,
-              fontSize: 14, fontFamily: "'Noto Sans SC'",
+              fontSize: 14, fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
               display: "inline-flex", alignItems: "center", gap: 8,
             }}>📤 上传 weibo_hot.json</span>
           </label>
@@ -2824,6 +3141,20 @@ const SANLIAN_STYLE_RULES = `
 ✗ "在这个快节奏的时代" ✗ "让我们一起..." ✗ "这个故事告诉我们"
 ✗ "在无数个夜晚" ✗ "那些日子里" ✗ "永恒的话题"
 ✗ "令人动容" ✗ "引人深思" ✗ "发人深省"
+
+【v17 新规则 - 减少双引号】
+很多 AI 生成的文案喜欢给普通词加引号,比如 "低精力" "突然" "情绪问题" —— 这让文字显得做作、AI 味儿重。
+规则:
+- 只有**真正的引语**(某人说的话、书名、新概念术语)才用引号
+- 普通词汇、形容词、常用短语一律**不加引号**
+- 一段话里,引号标注不要超过 1-2 处
+- 示范:
+  ✗ 当我们在谈论"低精力"或"情绪问题"时,可以少一些对个体意志的"苛责"
+  ✓ 当我们在谈论低精力或情绪问题时,可以少一些对个体意志的苛责
+  ✗ 那个"撑不住"的时刻就可能到来
+  ✓ 那个撑不住的时刻就可能到来
+  ✗ "突然"的情绪崩溃或行为异常
+  ✓ 那些看似突然的情绪崩溃或行为异常
 
 ═════════════════════════════════════════════
 【核心原则 4 - 格式要求】
@@ -3195,7 +3526,7 @@ ${articleExcerpt}
                 <div style={{ fontSize: 12, color: palette.textTri, marginBottom: 8, fontWeight: 500 }}>💬 封面金句</div>
                 <div style={{
                   fontSize: 16, color: palette.text, lineHeight: 1.7,
-                  fontFamily: "'Noto Serif SC', serif", fontStyle: "italic",
+                  fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif", fontStyle: "italic",
                 }}>&ldquo;{content.cover_hook}&rdquo;</div>
               </div>
             )}
@@ -3213,7 +3544,7 @@ ${articleExcerpt}
                   width: "100%", minHeight: 300, padding: 14,
                   border: `1px solid ${palette.border}`, borderRadius: 8,
                   fontSize: 14.5, lineHeight: 2, color: palette.text,
-                  fontFamily: "'Noto Serif SC', serif", resize: "vertical",
+                  fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif", resize: "vertical",
                   background: palette.cardAlt, outline: "none",
                 }}
               />
@@ -3261,7 +3592,7 @@ ${articleExcerpt}
                     background: activeTab === t.key ? gradPrimary : "transparent",
                     color: activeTab === t.key ? "#fff" : palette.textSec,
                     whiteSpace: "nowrap", transition: "all 0.15s",
-                    fontFamily: "'Noto Sans SC'",
+                    fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
                   }}>{t.label}</div>
               ))}
             </div>
@@ -3274,7 +3605,7 @@ ${articleExcerpt}
               }}>
                 <div style={{
                   fontSize: 11, color: palette.textTri, marginBottom: 8,
-                  fontFamily: "'Noto Sans SC'",
+                  fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
                 }}>
                   📄 正文页 (共 {articlePages.length} 页) {/^page-/.test(activeTab) && ` · 当前第 ${parseInt(activeTab.slice(5)) + 1} 页`}
                 </div>
@@ -3294,7 +3625,7 @@ ${articleExcerpt}
                         color: active ? "#fff" : palette.textSec,
                         border: `1px solid ${active ? palette.red : palette.border}`,
                         transition: "all 0.12s",
-                        fontFamily: "'Noto Sans SC'",
+                        fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
                       }}>{i + 1}</div>
                     );
                   })}
@@ -3305,7 +3636,7 @@ ${articleExcerpt}
             {/* 尺寸提示 */}
             <div style={{
               textAlign: "center", fontSize: 11, color: palette.textTri,
-              marginBottom: 10, fontFamily: "'Noto Sans SC'",
+              marginBottom: 10, fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
             }}>
               {activeTab === "note"
                 ? `📱 手机真机效果预览 · 模拟 iPhone 15 Pro Max`
@@ -3376,7 +3707,7 @@ ${articleExcerpt}
               <div style={{
                 marginTop: 14, display: "flex",
                 alignItems: "center", justifyContent: "center", gap: 10,
-                fontFamily: "'Noto Sans SC'",
+                fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
               }}>
                 <Btn variant="secondary" size="sm"
                   onClick={() => {
@@ -3419,6 +3750,7 @@ function GenerateShortPage({ hotTopic, onBack, onSaved }) {
   const [generating, setGenerating] = useState(false);
   const [searching, setSearching] = useState(false);
   const [searchResults, setSearchResults] = useState([]);
+  const [searchMeta, setSearchMeta] = useState(null);  // v16
   const [content, setContent] = useState(null);
   const [activeTab, setActiveTab] = useState("note");
 
@@ -3437,6 +3769,11 @@ function GenerateShortPage({ hotTopic, onBack, onSaved }) {
       const search = await webSearch(q, 5);
       const refs = search.results || [];
       setSearchResults(refs);
+      setSearchMeta({
+        source: search.source || "none",
+        attempts: search.attempts || [],
+        count: refs.length,
+      });
       setSearching(false);
 
       const searchContext = refs.length > 0
@@ -3470,7 +3807,7 @@ ${searchContext}
 {
   "xhs_title": "短新闻帖子标题,12-22字。可以是事实陈述式(如'法国全票通过「文物归还法案」')或带引号的人物话,禁止'揭示'等词",
   "cover_hook": "封面图上的主标题,15-35字,即帖子主标题或其精炼版",
-  "cover_summary": "封面图上的摘要正文,120-200字。结构:'据XX报道+时间+事件主体+关键信息+补充细节'。必须有具体的时间、地点、数字、人名或机构。写作示范可参考:'据央视新闻报道:当地时间4月13日,法国国民议会以170票赞成、0票反对通过一项法案...'",
+  "cover_summary": "封面图上的摘要正文,**严格控制在 80-110 字**(超过 110 字会溢出封面被遮挡!)。结构:'据XX报道+时间+事件主体+关键信息'。必须精炼,有具体的时间、地点、数字、人名或机构。只保留核心信息,补充细节放到正文文案里。示范:'据央视新闻报道:当地时间4月13日,法国国民议会以170票赞成、0票反对通过文物归还法案,这是法国首次系统化立法推动殖民时期文物返还。'(约 90 字,OK)",
   "caption": "小红书正文文案,180-300字。比封面摘要更详细一些,可以多讲一个细节或背景。结尾不需要'文|XX'(因为是实时新闻没有作者)但可以有一句克制的评价或上下文提示",
   "tags": ["5-8个具体的标签,不带#号"],
   "sources_used": ["这条短新闻里引用到的资料来源名,用于标注可信度。如['央视新闻','法新社','微博热搜AI智搜']"]
@@ -3649,15 +3986,22 @@ ${searchContext}
               🔥 热搜原题: <strong>{hotTopic.title}</strong>
             </div>
 
-            {/* 参考资料 */}
-            {searchResults.length > 0 && (
-              <div style={{
-                background: palette.card, borderRadius: 14, padding: 20, marginBottom: 14,
-                border: `1px solid ${palette.border}`,
-              }}>
-                <div style={{ fontSize: 12, color: palette.textTri, marginBottom: 10, fontWeight: 500 }}>
-                  🌐 补充资料来源 ({searchResults.length} 条)
-                </div>
+            {/* v16: 参考资料 —— 失败也要明确告知 */}
+            <div style={{
+              background: palette.card, borderRadius: 14, padding: 20, marginBottom: 14,
+              border: `1px solid ${palette.border}`,
+            }}>
+              <div style={{ fontSize: 12, color: palette.textTri, marginBottom: 10, fontWeight: 500 }}>
+                🌐 补充资料来源 ({searchResults.length} 条)
+                {searchMeta?.source && searchResults.length > 0 && (
+                  <span style={{
+                    marginLeft: 8, padding: "2px 8px", background: palette.cardAlt,
+                    borderRadius: 4, fontSize: 10.5, color: palette.textTri,
+                  }}>来源:{searchMeta.source}</span>
+                )}
+              </div>
+
+              {searchResults.length > 0 ? (
                 <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                   {searchResults.map((r, i) => (
                     <a
@@ -3669,14 +4013,42 @@ ${searchContext}
                       }}
                     >
                       <div style={{ fontWeight: 600, color: palette.blue }}>[{i + 1}] {r.title}</div>
-                      <div style={{ color: palette.textTri, fontSize: 11, marginTop: 2 }}>
-                        {(r.snippet || "").slice(0, 120)}...
+                      <div style={{ color: palette.textTri, fontSize: 11, marginTop: 2, wordBreak: "break-all" }}>
+                        {r.url}
                       </div>
+                      {r.snippet && (
+                        <div style={{ color: palette.textTri, fontSize: 11.5, marginTop: 4 }}>
+                          {(r.snippet || "").slice(0, 160)}
+                        </div>
+                      )}
                     </a>
                   ))}
                 </div>
-              </div>
-            )}
+              ) : (
+                <div style={{
+                  padding: 12, background: "#FEF2F2", borderRadius: 8,
+                  border: `1px solid ${palette.red}30`, fontSize: 12.5,
+                  color: "#991B1B", lineHeight: 1.75,
+                }}>
+                  <div style={{ fontWeight: 700, marginBottom: 4 }}>⚠️ 联网搜索未返回结果</div>
+                  {searchMeta?.attempts && searchMeta.attempts.length > 0 ? (
+                    <div>
+                      尝试了:
+                      {searchMeta.attempts.map((a, i) => (
+                        <span key={i} style={{ marginLeft: 6 }}>
+                          {a.source}({a.count})
+                        </span>
+                      ))}
+                      <div style={{ marginTop: 4, color: "#7F1D1D" }}>
+                        本次短新闻仅基于微博热搜 AI 智搜生成,发布前务必人工核实事实。
+                      </div>
+                    </div>
+                  ) : (
+                    <div>请检查后端是否为最新版本(需支持必应国内版/百度/搜狗)。</div>
+                  )}
+                </div>
+              )}
+            </div>
 
             {/* 警示 */}
             <div style={{
@@ -3712,7 +4084,7 @@ ${searchContext}
                   width: "100%", minHeight: 160, padding: 14,
                   border: `1px solid ${palette.border}`, borderRadius: 8,
                   fontSize: 14.5, lineHeight: 2, color: palette.text,
-                  fontFamily: "'Noto Serif SC', serif", resize: "vertical",
+                  fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif", resize: "vertical",
                   background: palette.cardAlt, outline: "none",
                 }}
               />
@@ -3731,7 +4103,7 @@ ${searchContext}
                   width: "100%", minHeight: 200, padding: 14,
                   border: `1px solid ${palette.border}`, borderRadius: 8,
                   fontSize: 14.5, lineHeight: 2, color: palette.text,
-                  fontFamily: "'Noto Serif SC', serif", resize: "vertical",
+                  fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif", resize: "vertical",
                   background: palette.cardAlt, outline: "none",
                 }}
               />
@@ -3771,7 +4143,7 @@ ${searchContext}
                     cursor: "pointer", borderRadius: 6, textAlign: "center",
                     background: activeTab === t.key ? gradPrimary : "transparent",
                     color: activeTab === t.key ? "#fff" : palette.textSec,
-                    transition: "all 0.15s", fontFamily: "'Noto Sans SC'",
+                    transition: "all 0.15s", fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
                   }}
                 >{t.label}</div>
               ))}
@@ -3779,7 +4151,7 @@ ${searchContext}
 
             <div style={{
               textAlign: "center", fontSize: 11, color: palette.textTri,
-              marginBottom: 10, fontFamily: "'Noto Sans SC'",
+              marginBottom: 10, fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
             }}>
               {activeTab === "note" ? "📱 手机真机效果预览" : "导出尺寸: 1242 × 1660 px"}
             </div>
@@ -3822,6 +4194,625 @@ ${searchContext}
 }
 
 // ============================================================
+// v15 新增: 【选题深化】页 —— 从深度报道选题推荐进入
+//   流程:搜集资料(web_search) → AI 生成选题角度建议 + 访谈提纲
+//   v16 更新: 每个角度自带完整思路, 不再分 Tab; 事实核查放顶部; 自动入史
+// ============================================================
+function TopicDeepenPage({ suggestion, hotTopic, onBack, onSaved }) {
+  const toast = useToast();
+  const [loading, setLoading] = useState(false);
+  const [progressMsg, setProgressMsg] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const [searchMeta, setSearchMeta] = useState(null);  // v16: 记录搜索源与尝试记录
+  const [deepenedContent, setDeepenedContent] = useState(null);
+
+  const runDeepen = async () => {
+    if (!suggestion || !hotTopic) { toast("数据缺失,无法深化", "error"); return; }
+    setLoading(true);
+
+    try {
+      // ==========================================================
+      // 第一步:web_search 补资料
+      // ==========================================================
+      setProgressMsg("正在联网搜索补充资料...");
+      const queries = [
+        suggestion.topic || hotTopic.title,
+        hotTopic.title + " 深度",
+      ];
+      const allResults = [];
+      let searchAttempts = [];
+      let searchSource = "";
+      for (const q of queries) {
+        if (!q) continue;
+        try {
+          const r = await webSearch(q, 4);
+          if (r && r.results) {
+            (r.results || []).forEach((x) => {
+              if (!allResults.find((y) => y.url === x.url)) allResults.push(x);
+            });
+          }
+          if (r && r.source && !searchSource) searchSource = r.source;
+          if (r && r.attempts) searchAttempts = r.attempts;
+        } catch (e) { console.warn("search fail:", e); }
+      }
+      setSearchResults(allResults.slice(0, 8));
+      setSearchMeta({ source: searchSource, attempts: searchAttempts, count: allResults.length });
+
+      // ==========================================================
+      // 第二步:AI 基于热搜+已有选题建议+搜索结果生成深化内容
+      // v16: 重写 prompt —— 不再分"角度"和"访谈提纲"两张皮, 改成每个
+      //       角度里自带【为什么做/要回答什么/论述核心/采访谁】
+      //       事实核查单独列为顶部的"大前提"
+      // ==========================================================
+      setProgressMsg("正在生成选题策划...");
+
+      const searchSnippets = allResults.slice(0, 8).map((r, i) =>
+        `[资料 ${i + 1}] ${r.title}\n${r.snippet || ""}\n来源: ${r.url}`
+      ).join("\n\n");
+
+      const deepenPrompt = `你是《三联生活周刊》的资深深度报道编辑。编辑部从今日热搜里挑出一个【值得新写的深度选题】,现在请你把它深化为一份【可落地的选题策划】——要给到选题记者手里能直接开跑的那种。
+
+【相关热搜】
+标题: ${hotTopic.title}
+AI 智搜详情:
+${(hotTopic.ai_summary || "").slice(0, 2000) || "(无)"}
+
+【编辑部初步建议】
+选题: ${suggestion.topic || ""}
+为何值得新写: ${suggestion.why_new || ""}
+初步切入角度: ${(suggestion.angles || []).join(" / ") || "(无)"}
+
+【联网搜索得到的最新资料】
+${searchSnippets || "(搜索结果为空,请主要基于上面的智搜详情)"}
+
+任务:产出一份完整的【选题策划】。
+
+结构分三层,从上到下:
+- **最顶层**: 热搜事件的【关键事实摘要】(给记者一份速查,不要总结/结论,只是快速陈列 what-happened)
+- **第二层**: 【全篇共享的事实核查清单】—— 所有角度都需核对的关键事实、数字、时间线
+- **第三层**: **3-4 个不同的切入角度**,每个是【一个可独立成稿的完整报道方案】,自带:
+  - 为什么选这个角度 (这个角度回应了热搜中的哪个具体问题)
+  - 这个角度要回答的核心问题 (读者读完应该知道什么)
+  - 论述重点与核心思路 (文章主脉络, 不是零碎点)
+  - 可能的采访对象 (3-4 类人, 每类说明"为什么采访他们"和"从他们那里大概想挖到什么"—— 不要列具体问题清单, 只给方向)
+  - 这个角度需要特别核查的数据 (如果有超出顶层清单外的)
+
+深度要求(非常重要):
+- 不要零散、不要套话。每个角度要像"一个真正可以签下来的报道方案"
+- "论述重点"部分要有真正的论点, 比如"平台表面合规但实际通过 XX 机制规避监管"这种有主张的话, 不要说"探讨 XX 与 XX 的关系"这种废话
+- "采访对象"只说类型 + 采访方向, 不列具体问题(记者自己会出)
+- "要回答的核心问题"要足够具体, 能看出这篇文章的独特价值
+- **event_brief 不是文章总结, 也不是编辑部的立场 —— 它是"原始事件是什么"的中立陈列**,只包含已知事实(时间/人物/金额/争议点),不做价值判断。记者看完这段要能立刻知道"哦,这件事大概是这样"。
+
+严格只返回 JSON,不要加任何 markdown 标记:
+{
+  "event_brief": {
+    "what_happened": "一段 80-120 字的中立事件陈列 —— 只写已经发生的事实(时间/地点/人物/金额/争议点/进展),不做价值判断,不说'本报道认为...',不说预期影响。像给同事做选题会时的 30 秒 briefing。",
+    "key_tensions": [
+      "争议点 1: 一句话,如 '平台方声称无法甄别资金来源 vs 民间质疑风控形同虚设'",
+      "争议点 2: 如 '个人行为失控 vs 制度性放任'",
+      "争议点 3: 如 '青少年数字消费教育的集体缺位'"
+    ],
+    "why_now": "60-80 字:这件事为什么现在值得做深度报道(时效性 / 典型性 / 未被充分讨论的面向)。这不是文章结论, 只是'为什么此刻选它'。"
+  },
+  "facts_to_verify": [
+    "需全文核查的事实 1,具体到时间/地点/人物/数字",
+    "事实 2",
+    "事实 3",
+    "事实 4",
+    "事实 5"
+  ],
+  "angles": [
+    {
+      "name": "角度名(精炼,如'个案追踪'、'平台责任'、'代际差异')",
+      "why_this_angle": "80-120 字:为什么值得做这个角度,它回应了热搜中的哪个具体焦点/争议",
+      "core_questions": "80-120 字:这个角度的文章要回答的 2-3 个核心问题,具体到能答出来的那种",
+      "narrative_core": "150-200 字:论述重点和主脉络 —— 要有真的论点、能站得住的主张,不是罗列。可以写'文章从 A 切入,论证 B,通过 C 和 D 两个案例证明 E'这种结构化的核心观点",
+      "interview_directions": [
+        {"target": "采访对象类型(如'平台风控技术主管,最好有反洗钱从业背景')", "why_and_what": "60-100 字:为什么要采访他们,从他们那里大概想挖到什么信息/观点"},
+        {"target": "采访对象类型2", "why_and_what": "..."},
+        {"target": "采访对象类型3", "why_and_what": "..."}
+      ],
+      "angle_specific_facts": ["这个角度特有、需要核查的事实(若无可留空数组 [])"]
+    }
+  ],
+  "writing_notes": "80-150 字,给负责这篇报道的记者的写作提示 —— 文风建议、结构建议、可能的伦理风险"
+}`;
+
+      const resp = await callAI(deepenPrompt, {
+        system: "你是一位做过很多深度报道的三联资深编辑,擅长把一个模糊的选题方向拆成可落地的报道方案。你特别讨厌零散、套话,喜欢有明确论点、结构紧凑的选题策划。只返回 JSON。",
+        maxTokens: 4500, temperature: 0.7,
+      });
+      let cleaned = resp.trim().replace(/^```json\s*/, "").replace(/\s*```$/, "").replace(/^```\s*/, "");
+      let parsed;
+      try { parsed = JSON.parse(cleaned); }
+      catch {
+        const s = cleaned.indexOf("{"), e = cleaned.lastIndexOf("}");
+        parsed = JSON.parse(cleaned.slice(s, e + 1));
+      }
+
+      setDeepenedContent(parsed);
+      setProgressMsg("");
+      toast("✅ 选题深化完成", "success");
+
+      // v16: 自动写入历史记录 (hot_topic_source='topic_deepen')
+      try {
+        await saveGeneratedContent({
+          hot_topic: hotTopic.title || "",
+          hot_topic_source: "topic_deepen",
+          article_id: null,
+          article_title: suggestion.topic || hotTopic.title || "(未命名选题)",
+          xhs_title: parsed.topic_summary
+            ? String(parsed.topic_summary).slice(0, 80)
+            : (suggestion.topic || "(深度选题策划)"),
+          xhs_caption: parsed.topic_summary || suggestion.why_new || "",
+          xhs_tags: (parsed.angles || []).map((a) => a.name).slice(0, 5),
+          // v16: 把完整策划 + 搜索结果都塞进来, 后面历史详情可回显
+          article_content_md: JSON.stringify({
+            __type: "topic_deepen_plan",
+            suggestion,
+            hot_topic: {
+              title: hotTopic.title, rank: hotTopic.rank,
+              ai_summary: hotTopic.ai_summary, url: hotTopic.url,
+            },
+            deepened: parsed,
+            search_results: allResults.slice(0, 8),
+            search_meta: { source: searchSource, attempts: searchAttempts },
+          }),
+          status: "draft",
+        });
+        onSaved?.();
+        toast("📝 已自动保存到历史记录", "success");
+      } catch (se) {
+        console.warn("自动保存选题到历史失败:", se);
+      }
+    } catch (e) {
+      console.error(e);
+      toast(`深化失败: ${e.message}`, "error");
+      setProgressMsg("");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!suggestion) {
+    return (
+      <div style={{ padding: 40, textAlign: "center" }}>
+        <div style={{ marginBottom: 20 }}>未选中选题</div>
+        <Btn onClick={onBack}>返回</Btn>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{ marginBottom: 20 }}>
+        <Btn variant="ghost" size="sm" onClick={onBack}>← 返回 AI 匹配推荐</Btn>
+      </div>
+
+      <SectionHeader
+        icon="🔍"
+        title="深度报道选题深化"
+        subtitle={suggestion.topic || ""}
+        color={palette.blue}
+        action={
+          !deepenedContent && !loading && (
+            <Btn variant="primary" onClick={runDeepen}>🚀 开始深化 (搜资料 + 生成提纲)</Btn>
+          )
+        }
+      />
+
+      {/* 来源热搜 */}
+      {hotTopic && (
+        <div style={{
+          padding: "14px 18px", background: palette.warm, borderRadius: 12,
+          marginBottom: 16, borderLeft: `3px solid ${palette.orange}`,
+        }}>
+          <div style={{ fontSize: 11, color: palette.textTri, marginBottom: 4 }}>
+            🔥 源自热搜 · 排名 {hotTopic.rank}
+          </div>
+          <div style={{
+            fontSize: 15, fontWeight: 700, color: palette.text,
+            fontFamily: "'Noto Serif SC'",
+          }}>{hotTopic.title}</div>
+        </div>
+      )}
+
+      {/* 初步建议 */}
+      {!deepenedContent && (
+        <div style={{
+          padding: 20, background: palette.card, borderRadius: 14,
+          border: `1px solid ${palette.border}`, marginBottom: 16,
+        }}>
+          <div style={{ fontWeight: 700, marginBottom: 10, fontSize: 14, color: palette.text }}>
+            📋 编辑部初步建议
+          </div>
+          {suggestion.why_new && (
+            <div style={{ fontSize: 13, lineHeight: 1.85, color: palette.textSec, marginBottom: 10 }}>
+              <strong style={{ color: palette.blue }}>为何值得新写:</strong> {suggestion.why_new}
+            </div>
+          )}
+          {(suggestion.angles || []).length > 0 && (
+            <div style={{ fontSize: 13, lineHeight: 1.85, color: palette.textSec }}>
+              <strong>初步切入角度:</strong>
+              <ul style={{ margin: "4px 0 0 0", paddingLeft: 22 }}>
+                {suggestion.angles.map((a, i) => <li key={i}>{a}</li>)}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Loading */}
+      {loading && (
+        <div style={{
+          padding: 60, textAlign: "center", background: palette.card,
+          borderRadius: 16, border: `1px solid ${palette.border}`,
+        }}>
+          <Spinner size={36} color={palette.blue} />
+          <div style={{
+            fontSize: 16, fontWeight: 700, marginTop: 14,
+            fontFamily: "'Noto Serif SC'", color: palette.text,
+          }}>{progressMsg || "深化中..."}</div>
+          <div style={{ fontSize: 12, color: palette.textTri, marginTop: 6 }}>
+            预计 30-60 秒
+          </div>
+        </div>
+      )}
+
+      {/* v16: 深化结果单页流式呈现 — 不再分 Tab */}
+      {!loading && deepenedContent && (
+        <>
+          {/* v16-fix: 用「事件简报」替代原来的「总体定位」 —— 中立事实陈列, 不是文章结论 */}
+          {deepenedContent.event_brief && (
+            <div style={{
+              padding: 22, marginBottom: 18, background: palette.card,
+              border: `1px solid ${palette.border}`, borderLeft: `4px solid ${palette.red}`,
+              borderRadius: 14,
+            }}>
+              <div style={{
+                fontSize: 13, fontWeight: 700, color: palette.red,
+                marginBottom: 10, letterSpacing: 0.5,
+                fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
+              }}>📰 热搜事件简报</div>
+
+              {/* 发生了什么 */}
+              {deepenedContent.event_brief.what_happened && (
+                <div style={{ marginBottom: 14 }}>
+                  <div style={{ fontSize: 11.5, fontWeight: 700, color: palette.textTri, marginBottom: 4,
+                                letterSpacing: 0.3 }}>发生了什么</div>
+                  <div style={{
+                    fontSize: 14, lineHeight: 1.92, color: palette.text,
+                    fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif",
+                  }}>{deepenedContent.event_brief.what_happened}</div>
+                </div>
+              )}
+
+              {/* 争议点 */}
+              {(deepenedContent.event_brief.key_tensions || []).length > 0 && (
+                <div style={{ marginBottom: 14 }}>
+                  <div style={{ fontSize: 11.5, fontWeight: 700, color: palette.textTri, marginBottom: 6,
+                                letterSpacing: 0.3 }}>关键争议点</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {deepenedContent.event_brief.key_tensions.map((t, i) => (
+                      <div key={i} style={{
+                        fontSize: 13, lineHeight: 1.8, color: palette.textSec,
+                        paddingLeft: 12, borderLeft: `2px solid ${palette.orange}60`,
+                        fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+                      }}>{t}</div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* 为什么此刻值得做 */}
+              {deepenedContent.event_brief.why_now && (
+                <div style={{
+                  padding: "10px 14px", background: palette.warm, borderRadius: 8,
+                  borderLeft: `3px solid ${palette.red}`,
+                }}>
+                  <div style={{ fontSize: 11.5, fontWeight: 700, color: palette.red, marginBottom: 4,
+                                letterSpacing: 0.3 }}>为什么此刻值得做</div>
+                  <div style={{
+                    fontSize: 13, lineHeight: 1.85, color: palette.text,
+                    fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+                  }}>{deepenedContent.event_brief.why_now}</div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 顶部 · 全篇共享的事实核查清单 */}
+          {(deepenedContent.facts_to_verify || []).length > 0 && (
+            <div style={{
+              padding: 20, marginBottom: 18,
+              background: "#FFF7E8", borderRadius: 14,
+              border: `1px dashed ${palette.orange}80`,
+            }}>
+              <div style={{
+                fontSize: 14, fontWeight: 700, marginBottom: 10, color: palette.orange,
+                fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
+              }}>
+                ⚠️ 事实核查清单 · 全篇共享(开跑前先做)
+              </div>
+              <ul style={{
+                margin: 0, paddingLeft: 22, fontSize: 13.5, lineHeight: 1.95,
+                color: palette.textSec,
+                fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+              }}>
+                {deepenedContent.facts_to_verify.map((f, i) => (
+                  <li key={i} style={{ marginBottom: 5 }}>{f}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* v16-fix: 角度翻页器 —— 上方 Tab 栏直接切换,不用往下滚 */}
+          <AngleTabs
+            angles={deepenedContent.angles || []}
+            writingNotes={deepenedContent.writing_notes || ""}
+          />
+
+          {/* 参考资料(底部) */}
+          <div style={{
+            marginTop: 28, paddingTop: 20, borderTop: `1px solid ${palette.border}`,
+          }}>
+            <div style={{
+              fontSize: 15, fontWeight: 700, color: palette.text, marginBottom: 12,
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
+            }}>
+              📚 联网搜索 · 参考资料 ({searchResults.length})
+              {searchMeta?.source && searchResults.length > 0 && (
+                <span style={{
+                  marginLeft: 8, fontSize: 11, fontWeight: 500, color: palette.textTri,
+                  padding: "2px 8px", background: palette.cardAlt, borderRadius: 4,
+                }}>来源:{searchMeta.source}</span>
+              )}
+            </div>
+
+            {/* v16: 明确提示搜索状态 */}
+            {searchResults.length === 0 && (
+              <div style={{
+                padding: 16, marginBottom: 12, background: "#FEF2F2",
+                borderRadius: 10, border: `1px solid ${palette.red}40`,
+                fontSize: 13, lineHeight: 1.8, color: "#991B1B",
+              }}>
+                <div style={{ fontWeight: 700, marginBottom: 6 }}>⚠️ 联网搜索未返回结果</div>
+                {searchMeta?.attempts && searchMeta.attempts.length > 0 ? (
+                  <div>
+                    <div style={{ marginBottom: 4 }}>尝试了以下搜索源但都没返回结果:</div>
+                    <ul style={{ margin: "4px 0 0 0", paddingLeft: 22, fontSize: 12.5 }}>
+                      {searchMeta.attempts.map((a, i) => (
+                        <li key={i}>{a.source}: {a.count} 条</li>
+                      ))}
+                    </ul>
+                    <div style={{ marginTop: 8, fontSize: 12, color: "#7F1D1D" }}>
+                      可能原因:后端所在网络访问不了搜索引擎(被墙/超时/被反爬)。
+                      本次选题策划仅基于微博热搜 AI 智搜详情,记者请更加注意事实核实。
+                    </div>
+                  </div>
+                ) : (
+                  <div>后端未返回搜索尝试记录,请检查 api_server 是否为最新版本。</div>
+                )}
+              </div>
+            )}
+
+            {searchResults.map((r, i) => (
+              <div key={i} style={{
+                padding: 14, marginBottom: 10, background: palette.card,
+                border: `1px solid ${palette.border}`, borderRadius: 10,
+              }}>
+                <a href={r.url} target="_blank" rel="noreferrer" style={{
+                  fontSize: 14, fontWeight: 700, color: palette.blue, textDecoration: "none",
+                  display: "block", marginBottom: 4,
+                }}>[{i + 1}] {r.title}</a>
+                <div style={{ fontSize: 11, color: palette.textTri, marginBottom: 6, wordBreak: "break-all" }}>
+                  {r.url}
+                </div>
+                {r.snippet && (
+                  <div style={{
+                    fontSize: 13, lineHeight: 1.75, color: palette.textSec,
+                    fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+                  }}>{r.snippet}</div>
+                )}
+              </div>
+            ))}
+
+            {searchResults.length > 0 && (
+              <div style={{
+                marginTop: 14, padding: 12, background: "#FFF7E8", borderRadius: 8,
+                fontSize: 12, color: palette.textSec, lineHeight: 1.75,
+                border: `1px dashed ${palette.orange}60`,
+              }}>
+                ⚠️ 参考资料来自公开网络检索,仅供参考。记者请自行核对事实、来源和数字准确性。
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// v16-fix: 角度翻页器 —— 上方 Tab 切换,不用往下滚
+// ============================================================
+function AngleTabs({ angles, writingNotes, readonly = false }) {
+  const [activeIdx, setActiveIdx] = useState(0);
+  if (!angles || angles.length === 0) return null;
+  const a = angles[activeIdx] || angles[0];
+
+  return (
+    <div style={{ marginTop: 20 }}>
+      {/* 翻页条 */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 10, marginBottom: 14,
+        flexWrap: "wrap",
+      }}>
+        <div style={{
+          fontSize: 14, fontWeight: 700, color: palette.text,
+          fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
+        }}>📐 可切入角度</div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {angles.map((ag, i) => (
+            <div key={i} onClick={() => setActiveIdx(i)} style={{
+              padding: "7px 14px", fontSize: 13, borderRadius: 8,
+              cursor: "pointer", transition: "all 0.15s",
+              background: activeIdx === i ? gradPrimary : palette.card,
+              color: activeIdx === i ? "#fff" : palette.textSec,
+              border: `1px solid ${activeIdx === i ? "transparent" : palette.border}`,
+              fontWeight: activeIdx === i ? 700 : 500,
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
+              whiteSpace: "nowrap",
+            }}>
+              <span style={{ opacity: 0.8, marginRight: 6 }}>角度 {i + 1}</span>
+              {ag.name}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* 选中角度的完整内容 */}
+      <div style={{
+        padding: 24, marginBottom: 16, background: palette.card,
+        border: `1px solid ${palette.border}`, borderLeft: `4px solid ${palette.blue}`,
+        borderRadius: 14,
+      }}>
+        <div style={{
+          fontSize: 19, fontWeight: 700, color: palette.text, marginBottom: 16,
+          fontFamily: "'Noto Serif SC'",
+        }}>
+          <span style={{
+            display: "inline-block", padding: "3px 10px", marginRight: 10,
+            background: `${palette.blue}14`, color: palette.blue,
+            borderRadius: 6, fontSize: 13, verticalAlign: "middle",
+          }}>角度 {activeIdx + 1} / {angles.length}</span>
+          {a.name}
+        </div>
+
+        {a.why_this_angle && (
+          <div style={{ marginBottom: 14 }}>
+            <div style={{
+              fontSize: 12, fontWeight: 700, color: palette.blue, marginBottom: 5,
+              letterSpacing: 0.3,
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
+            }}>为什么做这个角度</div>
+            <div style={{
+              fontSize: 13.5, lineHeight: 1.88, color: palette.textSec,
+              fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+            }}>{a.why_this_angle}</div>
+          </div>
+        )}
+
+        {a.core_questions && (
+          <div style={{ marginBottom: 14 }}>
+            <div style={{
+              fontSize: 12, fontWeight: 700, color: palette.blue, marginBottom: 5,
+              letterSpacing: 0.3,
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
+            }}>要回答的核心问题</div>
+            <div style={{
+              fontSize: 13.5, lineHeight: 1.88, color: palette.textSec,
+              fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+            }}>{a.core_questions}</div>
+          </div>
+        )}
+
+        {a.narrative_core && (
+          <div style={{
+            marginBottom: 14, padding: "12px 16px",
+            background: palette.warm, borderRadius: 10,
+          }}>
+            <div style={{
+              fontSize: 12, fontWeight: 700, color: palette.red, marginBottom: 5,
+              letterSpacing: 0.3,
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
+            }}>论述重点与核心思路</div>
+            <div style={{
+              fontSize: 13.8, lineHeight: 1.92, color: palette.text,
+              fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+            }}>{a.narrative_core}</div>
+          </div>
+        )}
+
+        {(a.interview_directions || []).length > 0 && (
+          <div style={{ marginBottom: 14 }}>
+            <div style={{
+              fontSize: 12, fontWeight: 700, color: palette.purple, marginBottom: 8,
+              letterSpacing: 0.3,
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
+            }}>建议采访方向</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {a.interview_directions.map((d, j) => (
+                <div key={j} style={{
+                  padding: "10px 14px", background: palette.cardAlt,
+                  borderRadius: 8, borderLeft: `3px solid ${palette.purple}60`,
+                }}>
+                  <div style={{
+                    fontSize: 13.5, fontWeight: 700, color: palette.text, marginBottom: 3,
+                    fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
+                  }}>🎯 {d.target}</div>
+                  <div style={{
+                    fontSize: 13, lineHeight: 1.8, color: palette.textSec,
+                    fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+                  }}>{d.why_and_what}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {(a.angle_specific_facts || []).length > 0 && (
+          <div style={{
+            padding: "10px 14px", background: "#FFF7E8", borderRadius: 8,
+            border: `1px dashed ${palette.orange}60`,
+          }}>
+            <div style={{
+              fontSize: 11.5, fontWeight: 700, color: palette.orange, marginBottom: 6,
+              letterSpacing: 0.3,
+            }}>⚠️ 本角度额外需核查</div>
+            <ul style={{ margin: 0, paddingLeft: 20, fontSize: 12.5, lineHeight: 1.8, color: palette.textSec }}>
+              {a.angle_specific_facts.map((f, j) => <li key={j}>{f}</li>)}
+            </ul>
+          </div>
+        )}
+      </div>
+
+      {/* 翻页导航 (底部) */}
+      <div style={{
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        marginBottom: 20, paddingTop: 4,
+      }}>
+        <Btn variant="secondary" size="sm" disabled={activeIdx === 0}
+          onClick={() => setActiveIdx(Math.max(0, activeIdx - 1))}>
+          ← 上一角度
+        </Btn>
+        <div style={{ fontSize: 12, color: palette.textTri }}>
+          {activeIdx + 1} / {angles.length}
+        </div>
+        <Btn variant="secondary" size="sm" disabled={activeIdx === angles.length - 1}
+          onClick={() => setActiveIdx(Math.min(angles.length - 1, activeIdx + 1))}>
+          下一角度 →
+        </Btn>
+      </div>
+
+      {/* 写作提示 (全局) */}
+      {writingNotes && (
+        <div style={{
+          padding: 18, margin: "10px 0", background: "#F0F4FA",
+          border: `1px solid ${palette.blue}40`, borderRadius: 12,
+          fontSize: 13, lineHeight: 1.88, color: palette.textSec,
+          fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+        }}>
+          <strong style={{ color: palette.blue }}>✏️ 写作提示 · </strong>
+          {writingNotes}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
 // 【历史记录】页 v14 - 支持多选批量删除
 // ============================================================
 function HistoryPage({ genHistory, onRefresh, onOpen }) {
@@ -3836,8 +4827,9 @@ function HistoryPage({ genHistory, onRefresh, onOpen }) {
 
   const filtered = useMemo(() => {
     let list = genHistory;
-    if (typeFilter === "long") list = list.filter((h) => h.hot_topic_source !== "weibo_short_news");
+    if (typeFilter === "long") list = list.filter((h) => !h.hot_topic_source || h.hot_topic_source === "weibo");
     if (typeFilter === "short") list = list.filter((h) => h.hot_topic_source === "weibo_short_news");
+    if (typeFilter === "topic") list = list.filter((h) => h.hot_topic_source === "topic_deepen");
     if (statusFilter !== "all") list = list.filter((h) => h.status === statusFilter);
     if (dateFilter !== "all") {
       const now = new Date();
@@ -3971,8 +4963,9 @@ function HistoryPage({ genHistory, onRefresh, onOpen }) {
   // 筛选项配置
   const typeOptions = [
     { key: "all", label: "全部", count: genHistory.length },
-    { key: "long", label: "📖 长文", count: genHistory.filter(h => h.hot_topic_source !== "weibo_short_news").length },
+    { key: "long", label: "📖 长文", count: genHistory.filter(h => !h.hot_topic_source || h.hot_topic_source === "weibo").length },
     { key: "short", label: "⚡ 短新闻", count: genHistory.filter(h => h.hot_topic_source === "weibo_short_news").length },
+    { key: "topic", label: "🔍 选题策划", count: genHistory.filter(h => h.hot_topic_source === "topic_deepen").length },
   ];
   const statusOptions = [
     { key: "all", label: "全部", count: genHistory.length },
@@ -4031,7 +5024,7 @@ function HistoryPage({ genHistory, onRefresh, onOpen }) {
               width: "100%", padding: "9px 12px",
               border: `1px solid ${palette.border}`, borderRadius: 8,
               fontSize: 13, outline: "none", marginBottom: 18, boxSizing: "border-box",
-              fontFamily: "'Noto Sans SC'",
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
             }}
           />
 
@@ -4046,6 +5039,7 @@ function HistoryPage({ genHistory, onRefresh, onOpen }) {
             <EmptyState icon="📋" title="没有匹配的记录" desc="换一组筛选条件看看,或去生成新内容" />
           ) : filtered.map((h) => {
             const isShort = h.hot_topic_source === "weibo_short_news";
+            const isTopic = h.hot_topic_source === "topic_deepen";
             const isSelected = selectedIds.has(h.id);
             return (
               <div
@@ -4085,13 +5079,18 @@ function HistoryPage({ genHistory, onRefresh, onOpen }) {
                 <div style={{
                   display: "flex", justifyContent: "space-between",
                   alignItems: "flex-start", gap: 12, flexWrap: "wrap",
-                  paddingLeft: selectMode ? 36 : 0,  // 给勾选框让位
+                  paddingLeft: selectMode ? 36 : 0,
                 }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
-                      <Pill color={isShort ? "#EDE4FF" : "#FFE4E8"} textColor={isShort ? palette.purple : palette.red}>
-                        {isShort ? "⚡ 短新闻" : "📖 长文"}
-                      </Pill>
+                      {/* v16: 加入 topic 类型 */}
+                      {isTopic ? (
+                        <Pill color="#E0F2FE" textColor={palette.blue}>🔍 选题策划</Pill>
+                      ) : isShort ? (
+                        <Pill color="#EDE4FF" textColor={palette.purple}>⚡ 短新闻</Pill>
+                      ) : (
+                        <Pill color="#FFE4E8" textColor={palette.red}>📖 长文</Pill>
+                      )}
                       {h.status === "published"
                         ? <Pill color="#D1FAE5" textColor="#065F46">✅ 已发布</Pill>
                         : <Pill color="#F3F4F6" textColor="#6B7280">📝 草稿</Pill>
@@ -4103,8 +5102,8 @@ function HistoryPage({ genHistory, onRefresh, onOpen }) {
                     <div style={{
                       fontSize: 17, fontWeight: 700, color: palette.text,
                       fontFamily: "'Noto Serif SC'", marginBottom: 6, lineHeight: 1.45,
-                    }}>{h.xhs_title}</div>
-                    {!isShort && h.article_title && (
+                    }}>{isTopic ? (h.article_title || h.xhs_title) : h.xhs_title}</div>
+                    {!isShort && !isTopic && h.article_title && (
                       <div style={{ fontSize: 12, color: palette.textTri, marginBottom: 6 }}>
                         基于旧文: 《{h.article_title}》
                       </div>
@@ -4128,7 +5127,9 @@ function HistoryPage({ genHistory, onRefresh, onOpen }) {
                     )}
                     <div style={{
                       marginTop: 12, fontSize: 11, color: palette.red, fontWeight: 500,
-                    }}>点击查看完整内容 / 下载图片 →</div>
+                    }}>
+                      {isTopic ? "点击查看完整选题策划 →" : "点击查看完整内容 / 下载图片 →"}
+                    </div>
                   </div>
                   <div
                     style={{ display: "flex", flexDirection: "column", gap: 6 }}
@@ -4163,25 +5164,232 @@ function HistoryDetailPage({ item, onBack }) {
   const pageRefs = useRef([]);
 
   const isShort = item.hot_topic_source === "weibo_short_news";
+  const isTopic = item.hot_topic_source === "topic_deepen";
 
-  // 重建 content 对象(兼容原来的 xxx_caption / xxx_title 字段命名)
+  // v16: 选题策划类型 —— 从 article_content_md 里还原结构化数据
+  const topicPlan = useMemo(() => {
+    if (!isTopic) return null;
+    try {
+      const parsed = JSON.parse(item.article_content_md || "{}");
+      if (parsed && parsed.__type === "topic_deepen_plan") return parsed;
+    } catch {}
+    return null;
+  }, [item, isTopic]);
+
+  // 所有 useMemo 必须在任何 return 之前调用(React Hook 规则)
   const content = useMemo(() => ({
     xhs_title: item.xhs_title || "",
     caption: item.xhs_caption || "",
     tags: item.xhs_tags || [],
-    cover_hook: "",   // 历史中没存, 降级用 title
-    cover_summary: item.article_content_md || "",  // 短新闻的 summary 存在这里
+    cover_hook: "",
+    cover_summary: item.article_content_md || "",
   }), [item]);
 
-  // 长文: 把原文分页
   const articleBlocks = useMemo(
-    () => isShort ? [] : parseArticleBlocks(item.article_content_md || ""),
-    [item, isShort]
+    () => (isShort || isTopic) ? [] : parseArticleBlocks(item.article_content_md || ""),
+    [item, isShort, isTopic]
   );
   const articlePages = useMemo(
     () => paginateBlocks(articleBlocks),
     [articleBlocks]
   );
+
+  // v16-fix: tabs 也必须在所有 return 之前 —— 修复 React Hook 违规报错
+  const tabs = useMemo(() => {
+    const t = [
+      { key: "note", label: "📱 笔记预览" },
+      { key: "cover", label: "🎨 封面" },
+    ];
+    articlePages.forEach((_, i) => t.push({ key: `page-${i}`, label: `📄 正文 ${i + 1}` }));
+    return t;
+  }, [articlePages]);
+
+  // v16: 选题策划提前渲染, 不走后面的图片预览流程
+  if (isTopic && topicPlan) {
+    const dp = topicPlan.deepened || {};
+    const ht = topicPlan.hot_topic || {};
+    const sr = topicPlan.search_results || [];
+    const sm = topicPlan.search_meta || {};
+
+    return (
+      <div>
+        <div style={{ marginBottom: 20 }}>
+          <Btn variant="ghost" size="sm" onClick={onBack}>← 返回历史记录</Btn>
+        </div>
+        <SectionHeader
+          icon="🔍"
+          title="选题策划 · 历史详情"
+          subtitle={`生成于 ${fmtBeijing(item.created_at)} · 源自热搜「${ht.title || "(无)"}」`}
+          color={palette.blue}
+        />
+
+        {/* 顶部 · 事件简报 (v16-fix 新结构) OR 旧的总体定位(向后兼容) */}
+        {dp.event_brief ? (
+          <div style={{
+            padding: 22, marginBottom: 18, background: palette.card,
+            border: `1px solid ${palette.border}`, borderLeft: `4px solid ${palette.red}`,
+            borderRadius: 14,
+          }}>
+            <div style={{
+              fontSize: 13, fontWeight: 700, color: palette.red,
+              marginBottom: 10, letterSpacing: 0.5,
+            }}>📰 热搜事件简报</div>
+
+            {dp.event_brief.what_happened && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 11.5, fontWeight: 700, color: palette.textTri,
+                              marginBottom: 4, letterSpacing: 0.3 }}>发生了什么</div>
+                <div style={{
+                  fontSize: 14, lineHeight: 1.92, color: palette.text,
+                  fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+                }}>{dp.event_brief.what_happened}</div>
+              </div>
+            )}
+
+            {(dp.event_brief.key_tensions || []).length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 11.5, fontWeight: 700, color: palette.textTri,
+                              marginBottom: 6, letterSpacing: 0.3 }}>关键争议点</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {dp.event_brief.key_tensions.map((t, i) => (
+                    <div key={i} style={{
+                      fontSize: 13, lineHeight: 1.8, color: palette.textSec,
+                      paddingLeft: 12, borderLeft: `2px solid ${palette.orange}60`,
+                      fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+                    }}>{t}</div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {dp.event_brief.why_now && (
+              <div style={{
+                padding: "10px 14px", background: palette.warm, borderRadius: 8,
+                borderLeft: `3px solid ${palette.red}`,
+              }}>
+                <div style={{ fontSize: 11.5, fontWeight: 700, color: palette.red,
+                              marginBottom: 4, letterSpacing: 0.3 }}>为什么此刻值得做</div>
+                <div style={{
+                  fontSize: 13, lineHeight: 1.85, color: palette.text,
+                  fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+                }}>{dp.event_brief.why_now}</div>
+              </div>
+            )}
+          </div>
+        ) : dp.topic_summary && (
+          // 向后兼容:v16-fix 之前保存的旧格式
+          <div style={{
+            padding: 22, marginBottom: 18, background: palette.card,
+            border: `1px solid ${palette.border}`, borderLeft: `4px solid ${palette.red}`,
+            borderRadius: 14,
+          }}>
+            <div style={{
+              fontSize: 13, fontWeight: 700, color: palette.red,
+              marginBottom: 8, letterSpacing: 0.5,
+            }}>📌 选题总体定位(旧版本保存)</div>
+            <div style={{
+              fontSize: 14.5, lineHeight: 1.95, color: palette.text,
+              fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+            }}>{dp.topic_summary}</div>
+          </div>
+        )}
+
+        {/* 事实核查清单 */}
+        {(dp.facts_to_verify || []).length > 0 && (
+          <div style={{
+            padding: 20, marginBottom: 18,
+            background: "#FFF7E8", borderRadius: 14,
+            border: `1px dashed ${palette.orange}80`,
+          }}>
+            <div style={{
+              fontSize: 14, fontWeight: 700, marginBottom: 10, color: palette.orange,
+            }}>⚠️ 事实核查清单 · 全篇共享(开跑前先做)</div>
+            <ul style={{
+              margin: 0, paddingLeft: 22, fontSize: 13.5, lineHeight: 1.95,
+              color: palette.textSec,
+              fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif",
+            }}>
+              {dp.facts_to_verify.map((f, i) => <li key={i} style={{ marginBottom: 5 }}>{f}</li>)}
+            </ul>
+          </div>
+        )}
+
+        {/* v16-fix: 使用 AngleTabs 组件 —— 上方 Tab 切换 */}
+        <AngleTabs
+          angles={dp.angles || []}
+          writingNotes={dp.writing_notes || ""}
+          readonly={true}
+        />
+
+        {/* 参考资料 */}
+        <div style={{ marginTop: 28, paddingTop: 20, borderTop: `1px solid ${palette.border}` }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: palette.text, marginBottom: 12 }}>
+            📚 联网搜索 · 参考资料 ({sr.length})
+            {sm.source && sr.length > 0 && (
+              <span style={{
+                marginLeft: 8, fontSize: 11, fontWeight: 500, color: palette.textTri,
+                padding: "2px 8px", background: palette.cardAlt, borderRadius: 4,
+              }}>来源:{sm.source}</span>
+            )}
+          </div>
+
+          {sr.length === 0 ? (
+            <div style={{
+              padding: 14, background: "#FEF2F2", borderRadius: 10,
+              border: `1px solid ${palette.red}40`, fontSize: 13, lineHeight: 1.8, color: "#991B1B",
+            }}>
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>本次深化时联网搜索未返回结果</div>
+              {(sm.attempts || []).length > 0 && (
+                <div style={{ fontSize: 12.5 }}>
+                  尝试了:{sm.attempts.map(a => `${a.source}(${a.count})`).join(" / ")}
+                </div>
+              )}
+            </div>
+          ) : sr.map((r, i) => (
+            <div key={i} style={{
+              padding: 14, marginBottom: 10, background: palette.card,
+              border: `1px solid ${palette.border}`, borderRadius: 10,
+            }}>
+              <a href={r.url} target="_blank" rel="noreferrer" style={{
+                fontSize: 14, fontWeight: 700, color: palette.blue, textDecoration: "none",
+                display: "block", marginBottom: 4,
+              }}>[{i + 1}] {r.title}</a>
+              <div style={{ fontSize: 11, color: palette.textTri, marginBottom: 6, wordBreak: "break-all" }}>
+                {r.url}
+              </div>
+              {r.snippet && (
+                <div style={{ fontSize: 13, lineHeight: 1.75, color: palette.textSec,
+                              fontFamily: "'Noto Serif SC', 'SimSun', '宋体', serif" }}>
+                  {r.snippet}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // v16: topic_deepen 但 JSON 无法解析 —— 降级为裸显示
+  if (isTopic && !topicPlan) {
+    return (
+      <div>
+        <div style={{ marginBottom: 20 }}>
+          <Btn variant="ghost" size="sm" onClick={onBack}>← 返回历史记录</Btn>
+        </div>
+        <SectionHeader
+          icon="🔍" title="选题策划(旧格式)"
+          subtitle={`生成于 ${fmtBeijing(item.created_at)}`}
+          color={palette.blue}
+        />
+        <div style={{ padding: 20, background: palette.card, borderRadius: 12,
+                      border: `1px solid ${palette.border}`, fontSize: 13,
+                      color: palette.textSec, lineHeight: 1.85, whiteSpace: "pre-wrap" }}>
+          {item.article_content_md || "(无内容)"}
+        </div>
+      </div>
+    );
+  }
 
   const copyAll = () => {
     const txt = [content.xhs_title, "", content.caption, "",
@@ -4220,15 +5428,6 @@ function HistoryDetailPage({ item, onBack }) {
     toast(ok ? "✅ 已批量下载" : "部分下载失败", ok ? "success" : "warning");
   };
 
-  const tabs = useMemo(() => {
-    const t = [
-      { key: "note", label: "📱 笔记预览" },
-      { key: "cover", label: "🎨 封面" },
-    ];
-    articlePages.forEach((_, i) => t.push({ key: `page-${i}`, label: `📄 正文 ${i + 1}` }));
-    return t;
-  }, [articlePages]);
-
   return (
     <div>
       <SectionHeader
@@ -4264,7 +5463,7 @@ function HistoryDetailPage({ item, onBack }) {
             <div style={{ fontSize: 12, color: palette.textTri, marginBottom: 8 }}>📌 小红书标题</div>
             <div style={{
               fontSize: 22, fontWeight: 800, lineHeight: 1.45, color: palette.text,
-              fontFamily: "'Noto Serif SC', serif",
+              fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif",
             }}>{content.xhs_title}</div>
           </div>
 
@@ -4285,7 +5484,7 @@ function HistoryDetailPage({ item, onBack }) {
             <div style={{ fontSize: 12, color: palette.textTri, marginBottom: 10 }}>📝 正文文案</div>
             <div style={{
               fontSize: 15, lineHeight: 1.95, color: palette.text,
-              whiteSpace: "pre-wrap", fontFamily: "'Noto Serif SC', serif",
+              whiteSpace: "pre-wrap", fontFamily: "'Noto Serif SC', 'SimSun', '宋体', 'Microsoft YaHei', '微软雅黑', serif",
             }}>{content.caption}</div>
           </div>
 
@@ -4326,7 +5525,7 @@ function HistoryDetailPage({ item, onBack }) {
                   cursor: "pointer", borderRadius: 6, textAlign: "center",
                   background: activeTab === t.key ? gradPrimary : "transparent",
                   color: activeTab === t.key ? "#fff" : palette.textSec,
-                  fontFamily: "'Noto Sans SC'",
+                  fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
                 }}>{t.label}</div>
             ))}
           </div>
@@ -4337,7 +5536,7 @@ function HistoryDetailPage({ item, onBack }) {
               background: palette.card, borderRadius: 10, padding: "10px 12px",
               border: `1px solid ${palette.border}`, marginBottom: 10,
             }}>
-              <div style={{ fontSize: 11, color: palette.textTri, marginBottom: 8, fontFamily: "'Noto Sans SC'" }}>
+              <div style={{ fontSize: 11, color: palette.textTri, marginBottom: 8, fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif" }}>
                 📄 正文页 (共 {articlePages.length} 页) {/^page-/.test(activeTab) && ` · 当前第 ${parseInt(activeTab.slice(5)) + 1} 页`}
               </div>
               <div style={{
@@ -4354,7 +5553,7 @@ function HistoryDetailPage({ item, onBack }) {
                       background: active ? palette.red : palette.cardAlt,
                       color: active ? "#fff" : palette.textSec,
                       border: `1px solid ${active ? palette.red : palette.border}`,
-                      fontFamily: "'Noto Sans SC'",
+                      fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
                     }}>{i + 1}</div>
                   );
                 })}
@@ -4437,7 +5636,7 @@ function HistoryDetailPage({ item, onBack }) {
             <div style={{
               marginTop: 14, display: "flex",
               alignItems: "center", justifyContent: "center", gap: 10,
-              fontFamily: "'Noto Sans SC'",
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
             }}>
               <Btn variant="secondary" size="sm"
                 onClick={() => {
@@ -4489,7 +5688,7 @@ function FilterGroup({ title, options, value, onChange }) {
               background: value === o.key ? `${palette.red}10` : "transparent",
               color: value === o.key ? palette.red : palette.textSec,
               fontWeight: value === o.key ? 600 : 400,
-              fontFamily: "'Noto Sans SC'",
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
               transition: "all 0.15s",
             }}
             onMouseEnter={(e) => { if (value !== o.key) e.currentTarget.style.background = palette.warm; }}
@@ -4624,7 +5823,7 @@ function Sidebar({ activeRoute, onNavigate }) {
               fontWeight: active ? 600 : 500,
               fontSize: 14.5, transition: "all 0.2s",
               borderLeft: active ? `3px solid ${palette.red}` : "3px solid transparent",
-              fontFamily: "'Noto Sans SC'",
+              fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
             }}
             onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = palette.warm; }}
             onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = "transparent"; }}
@@ -4665,6 +5864,11 @@ function AppMain() {
     try { return JSON.parse(localStorage.getItem("xhs_short_recs") || "[]"); }
     catch { return []; }
   });
+  // v15: 深度报道选题建议
+  const [topicSuggestions, setTopicSuggestions] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("xhs_topic_suggestions") || "[]"); }
+    catch { return []; }
+  });
   const [lastMatchedAt, setLastMatchedAt] = useState(() => {
     const t = localStorage.getItem("xhs_last_matched_at");
     return t ? new Date(t) : null;
@@ -4674,6 +5878,10 @@ function AppMain() {
   // v7: 历史记录详情查看
   const [viewingHistory, setViewingHistory] = useState(null);
 
+  // v15: 正在深化的选题 (选题建议 → 深化页 的状态)
+  const [deepeningSuggestion, setDeepeningSuggestion] = useState(null);
+  const [deepeningHotTopic, setDeepeningHotTopic] = useState(null);
+
   // localStorage 同步
   useEffect(() => {
     try { localStorage.setItem("xhs_long_recs", JSON.stringify(longRecs)); } catch {}
@@ -4681,6 +5889,9 @@ function AppMain() {
   useEffect(() => {
     try { localStorage.setItem("xhs_short_recs", JSON.stringify(shortRecs)); } catch {}
   }, [shortRecs]);
+  useEffect(() => {
+    try { localStorage.setItem("xhs_topic_suggestions", JSON.stringify(topicSuggestions)); } catch {}
+  }, [topicSuggestions]);
   useEffect(() => {
     if (lastMatchedAt) localStorage.setItem("xhs_last_matched_at", lastMatchedAt.toISOString());
   }, [lastMatchedAt]);
@@ -4824,6 +6035,13 @@ function AppMain() {
     setRoute("generate");
   };
 
+  // v15: 从 AI 匹配跳转到选题深化
+  const handlePickTopicSuggestion = (suggestion, hotTopic) => {
+    setDeepeningSuggestion(suggestion);
+    setDeepeningHotTopic(hotTopic);
+    setRoute("topic_deepen");
+  };
+
   // 在内容生成页切换模式(当独立进入时)
   const renderGeneratePage = () => {
     // 子面板: 顶部可切换 长文/短新闻 模式
@@ -4846,7 +6064,7 @@ function AppMain() {
                 cursor: "pointer", borderRadius: 6, textAlign: "center",
                 background: genMode === m.key ? gradPrimary : "transparent",
                 color: genMode === m.key ? "#fff" : palette.textSec,
-                transition: "all 0.15s", fontFamily: "'Noto Sans SC'",
+                transition: "all 0.15s", fontFamily: "'Noto Sans SC', -apple-system, 'PingFang SC', 'Microsoft YaHei', '微软雅黑', 'SimHei', '黑体', sans-serif",
               }}
             >{m.label}</div>
           ))}
@@ -4944,8 +6162,10 @@ function AppMain() {
             articles={articles} weiboHot={weiboHot}
             onPickLongForm={handlePickLongForm}
             onPickShortNews={handlePickShortNews}
+            onPickTopicSuggestion={handlePickTopicSuggestion}
             longRecs={longRecs} setLongRecs={setLongRecs}
             shortRecs={shortRecs} setShortRecs={setShortRecs}
+            topicSuggestions={topicSuggestions} setTopicSuggestions={setTopicSuggestions}
             lastMatchedAt={lastMatchedAt} setLastMatchedAt={setLastMatchedAt}
             activeTab={matchTab} setActiveTab={setMatchTab}
             matchHistory={matchHistory} reloadMatchHistory={loadMatchHistory}
@@ -4953,6 +6173,15 @@ function AppMain() {
         );
       case "generate":
         return renderGeneratePage();
+      case "topic_deepen":
+        return (
+          <TopicDeepenPage
+            suggestion={deepeningSuggestion}
+            hotTopic={deepeningHotTopic}
+            onBack={() => setRoute("match")}
+            onSaved={loadGenHistory}
+          />
+        );
       case "history":
         return (
           <HistoryPage
